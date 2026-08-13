@@ -62,6 +62,32 @@ export function StatusBadge({ status }: { status: LaunchState }) {
   );
 }
 
+export function CountdownBadge({ seconds, totalSeconds }: { seconds: number; totalSeconds: number }) {
+  const ratio = totalSeconds > 0 ? seconds / totalSeconds : 0;
+  // Heat scale: emerald > lime > amber > orange > red as the remaining ratio drops.
+  const tone =
+    ratio > 0.66 ? { cls: 'text-emerald-200 bg-emerald-500/15 border border-emerald-400/50', dot: 'bg-emerald-400' } :
+    ratio > 0.40 ? { cls: 'text-lime-200    bg-lime-500/15    border border-lime-400/50',    dot: 'bg-lime-400'    } :
+    ratio > 0.20 ? { cls: 'text-amber-200   bg-amber-500/15   border border-amber-400/50',   dot: 'bg-amber-400'   } :
+    ratio > 0.08 ? { cls: 'text-orange-200  bg-orange-500/15  border border-orange-400/50',  dot: 'bg-orange-400'  } :
+                   { cls: 'text-red-200     bg-red-500/15     border border-red-400/50',     dot: 'bg-red-400'     };
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md text-[10px] font-bold tracking-wide whitespace-nowrap ${tone.cls}`}>
+      <span className={`w-1.5 h-1.5 rounded-full ${tone.dot}`} />
+      {formatCountdown(seconds)}
+    </span>
+  );
+}
+
+function formatCountdown(sec: number): string {
+  const t = Math.max(0, sec);
+  const h = Math.floor(t / 3600);
+  const m = Math.floor((t % 3600) / 60);
+  const s = t % 60;
+  const pad = (n: number) => n.toString().padStart(2, '0');
+  return `${pad(h)}:${pad(m)}:${pad(s)}`;
+}
+
 // Larger variant used by the splash screen. Same color semantics, taller +
 // wider padding + larger text so it can stand on its own as the focal item
 // of a minimalist auto-launch window.

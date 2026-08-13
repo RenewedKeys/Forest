@@ -42,6 +42,8 @@ public partial class App : Application
         Forest.PolProxy.Log = m => Program.T(m);
         try { Forest.PolProxy.CleanHosts(); } catch { }
 
+        try { Forest.Diagnostics.LogStartupSnapshot(); } catch (Exception dx) { Program.T("Diagnostics.LogStartupSnapshot failed: " + dx); }
+
         base.OnStartup(e);
         try
         {
@@ -90,6 +92,19 @@ public partial class App : Application
                     if (useSplash) bridge.ArmSplash(autoLaunchProfiles, autoQuit);
                     bridge.LaunchProgrammatic(autoLaunchProfiles);
                 };
+            }
+
+            if (cfg.CheckUpdatesOnStartup)
+            {
+                _ = System.Threading.Tasks.Task.Run(async () =>
+                {
+                    try
+                    {
+                        await System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(8));
+                        await Forest.UpdateManager.Instance.CheckAsync(respectSkip: true);
+                    }
+                    catch (Exception cex) { Program.T("UpdateManager startup check failed: " + cex.Message); }
+                });
             }
         }
         catch (Exception ex)

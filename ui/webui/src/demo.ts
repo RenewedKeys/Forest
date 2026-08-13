@@ -25,7 +25,7 @@ const ROWS: Row[] = [
 
 export const demoAccounts: Account[] = ROWS.map((r) => ({
   profile: r.profile, windower: r.windower, polSlot: r.slot, ingameSlot: 1,
-  launcher: r.launcher, launchArgs: '', hasTotp: false,
+  launcher: r.launcher, launchArgs: '', launcherExe: '', hasTotp: false,
 }));
 
 export const demoStatuses: AccountStatus[] = ROWS.map((r, i) => ({
@@ -60,6 +60,18 @@ export const demoConfig: Config = {
   overrideFFXiResolution: true,
   launchMode: 'Full',
   debugLogging: false,
+  autoTerminateEnabled: false,
+  autoTerminateMinutes: 360,
+  minSecondsBetweenLaunches: 0,
+  checkUpdatesOnStartup: true,
+  skippedUpdateVersion: '',
+  diagnosticsUploadUrl: '',
+  currentVersion: '1.2.11',
+  clockSkewSeconds: null,
+  loginBinBackupEnabled: true,
+  loginBinBackupsKeep: 10,
+  loginBinPathOverrides: [],
   selectedAccounts: [],
   accountOrder: ROWS.map((r) => r.profile),
+  isElevated: false,
 };

@@ -10,6 +10,7 @@ export interface Account {
   ingameSlot: number;  // FFXI character slot 1-16, 0 = first
   launcher: Launcher;  // per-account launcher, 'Default' falls back to config
   launchArgs: string;  // custom args, '' = use launcher default template
+  launcherExe: string; // per-account launcher exe override, '' = use global Settings path
   hasTotp: boolean;    // whether a TOTP secret is stored (the secret itself never crosses the bridge)
 }
 
@@ -29,6 +30,9 @@ export interface AccountStatus {
   profile: string;
   pid: number;          // pol.exe pid, 0 = none
   status: LaunchState;
+  countdownSeconds?: number | null;       // seconds until termination (lower of auto + manual)
+  countdownTotalSeconds?: number | null;  // original duration, for heat-color ratio
+  countdownSource?: 'auto' | 'manual' | null;
 }
 
 export interface Config {
@@ -54,8 +58,76 @@ export interface Config {
   overrideFFXiResolution: boolean;
   launchMode: 'Full' | 'Splash';
   debugLogging: boolean;
+  autoTerminateEnabled: boolean;
+  autoTerminateMinutes: number;
+  minSecondsBetweenLaunches: number;
+  checkUpdatesOnStartup: boolean;
+  skippedUpdateVersion: string;
+  diagnosticsUploadUrl: string;
+  currentVersion: string;
+  clockSkewSeconds: number | null;
+  loginBinBackupEnabled: boolean;
+  loginBinBackupsKeep: number;
+  loginBinPathOverrides: string[];
   selectedAccounts: string[];
   accountOrder: string[];
+  // Read-only: emitted by the bridge, ignored on patch. Reflects whether
+  // the Forest process is running with Windows administrator rights.
+  isElevated: boolean;
+}
+
+export type UpdateKind =
+  | 'idle' | 'checking' | 'available' | 'none'
+  | 'downloading' | 'installing' | 'installed' | 'error';
+
+export interface UpdateChannel {
+  kind: UpdateKind;
+  version?: string | null;
+  notes?: string | null;
+  url?: string | null;
+  downloaded?: number;
+  total?: number | null;
+  message?: string | null;
+}
+
+export interface UpdateSnapshot {
+  desktop: UpdateChannel;
+  currentVersion: string;
+  checkOnStartup: boolean;
+  lastCheckIso?: string | null;
+}
+
+export interface DiagUploadResult {
+  ok: boolean;
+  id?: string | null;
+  url?: string | null;
+  error?: string | null;
+}
+
+export interface PolBackupCandidate {
+  path: string;
+  source: string;
+  exists: boolean;
+}
+
+export interface PolBackupDiscovery {
+  paths: PolBackupCandidate[];
+  backupDir: string;
+}
+
+export interface PolBackupEntry {
+  backupPath: string;
+  targetPath: string;
+  targetSource: string;
+  createdUtc: string;
+  sizeBytes: number;
+  isPreRestoreEmergency: boolean;
+}
+
+export interface PolRestoreResult {
+  ok: boolean;
+  emergencyBackupPath?: string | null;
+  error?: string | null;
 }
 
 // Payload for creating/updating an account. `password`/`totpSecret` are write-only
@@ -68,8 +140,10 @@ export interface AccountSave {
   ingameSlot: number;
   launcher: Launcher;
   launchArgs: string;
+  launcherExe?: string;     // optional per-account launcher exe override
   password?: string;
   totpSecret?: string;
+  clearTotp?: boolean;
 }
 
 export interface StaleProc {

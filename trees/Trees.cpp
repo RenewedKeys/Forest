@@ -19,6 +19,56 @@
 
 static volatile LONG g_inGameFired = 0;
 
+static void Log(const char* fmt, ...);
+
+// Walk the current process's loaded modules and find the one containing addr.
+// Used by diagnostic logs to identify hooks/injections from other DLLs.
+static bool ResolveAddrToModule(uintptr_t addr, char* nameOut, DWORD nameCap,
+                                uintptr_t* baseOut, DWORD* sizeOut)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) return false;
+    MODULEENTRY32 me{ sizeof(me) };
+    bool found = false;
+    for (BOOL ok = Module32First(snap, &me); ok; ok = Module32Next(snap, &me)) {
+        uintptr_t b = (uintptr_t)me.modBaseAddr;
+        if (addr >= b && addr < b + me.modBaseSize) {
+            strncpy_s(nameOut, nameCap, me.szModule, _TRUNCATE);
+            if (baseOut) *baseOut = b;
+            if (sizeOut) *sizeOut = me.modBaseSize;
+            found = true;
+            break;
+        }
+    }
+    CloseHandle(snap);
+    if (!found && nameOut) strncpy_s(nameOut, nameCap, "(heap/unowned)", _TRUNCATE);
+    return found;
+}
+
+// Enumerate every module currently loaded in this process and emit one log
+// line per module: name + base + size. Called once at Trees.dll injection
+// time so every trees.log captures the full module list — invaluable for
+// diagnosing third-party hooks (Ashita polplugins, Windower addons, etc.)
+// without having to ask the user which addons they have installed.
+static void LogLoadedModules()
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, GetCurrentProcessId());
+    if (snap == INVALID_HANDLE_VALUE) {
+        Log("MODULE-LIST: snapshot failed (err=%lu)", GetLastError());
+        return;
+    }
+    MODULEENTRY32 me{ sizeof(me) };
+    int n = 0;
+    Log("MODULE-LIST: begin");
+    for (BOOL ok = Module32First(snap, &me); ok; ok = Module32Next(snap, &me)) {
+        Log("MODULE-LIST:   %s  base=0x%08X  size=0x%X",
+            me.szModule, (unsigned)(uintptr_t)me.modBaseAddr, me.modBaseSize);
+        ++n;
+    }
+    CloseHandle(snap);
+    Log("MODULE-LIST: end (%d modules)", n);
+}
+
 static void LogPath(char* out, DWORD n)
 {
     HMODULE self = nullptr;
@@ -515,6 +565,26 @@ static void VehCapture(uint32_t ecx, uint32_t rowArg)
     g_selRowRing[i % VEH_CAP_RING] = ecx;
     g_selRowArg[i % VEH_CAP_RING] = rowArg;
 }
+
+struct EcxVtSeen { uint32_t ecx; uint32_t vt; };
+static EcxVtSeen g_ecxVtHistory[16] = {};
+static int       g_ecxVtIdx = 0;
+
+static uint32_t LookupPrevVt(uint32_t ecx)
+{
+    for (int i = 0; i < 16; ++i)
+        if (g_ecxVtHistory[i].ecx == ecx) return g_ecxVtHistory[i].vt;
+    return 0;
+}
+static void RecordVt(uint32_t ecx, uint32_t vt)
+{
+    for (int i = 0; i < 16; ++i)
+        if (g_ecxVtHistory[i].ecx == ecx) { g_ecxVtHistory[i].vt = vt; return; }
+    g_ecxVtHistory[g_ecxVtIdx % 16].ecx = ecx;
+    g_ecxVtHistory[g_ecxVtIdx % 16].vt  = vt;
+    ++g_ecxVtIdx;
+}
+
 static void FlushSelRowRing(uint32_t base)
 {
     LONG wr = g_selRowWr;
@@ -525,12 +595,43 @@ static void FlushSelRowRing(uint32_t base)
         if (!ecx) continue;
         uint32_t vt = 0;
         __try { vt = *(uint32_t*)ecx; } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        if (vt >= base && vt <= base + 0x600000)
+
+        uint32_t prevVt = LookupPrevVt(ecx);
+        RecordVt(ecx, vt);
+        bool isAppDll  = (vt >= base && vt <= base + 0x600000);
+        bool wasAppDll = (prevVt >= base && prevVt <= base + 0x600000);
+        if (prevVt && prevVt != vt && wasAppDll && !isAppDll) {
+            char modName[MAX_PATH] = "(unknown)"; uintptr_t modBase = 0; DWORD modSize = 0;
+            ResolveAddrToModule(vt, modName, sizeof(modName), &modBase, &modSize);
+            Log("DIALOG-HIJACK: ecx=0x%08X vtable swapped app.dll+0x%X -> 0x%08X (module=%s) -- "
+                "Trees mask scan will likely go blind until Path B rescue kicks in.",
+                ecx, prevVt - base, vt, modName);
+
+            __try {
+                for (int slot = 0; slot < 24; ++slot) {
+                    uint32_t fnPtr = *(uint32_t*)(vt + slot * 4);
+                    if (!fnPtr) { Log("  HIJACK-VTBL[%d] = 0x00000000 (null)", slot); continue; }
+                    char fnMod[MAX_PATH] = "(unknown)"; uintptr_t fnModBase = 0; DWORD fnModSize = 0;
+                    ResolveAddrToModule(fnPtr, fnMod, sizeof(fnMod), &fnModBase, &fnModSize);
+                    Log("  HIJACK-VTBL[%d] = 0x%08X (%s+0x%X)", slot, fnPtr, fnMod,
+                        fnModBase ? (unsigned)(fnPtr - fnModBase) : 0u);
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {
+                Log("  HIJACK-VTBL: dump faulted at slot read");
+            }
+        }
+
+        if (isAppDll)
             Log("VEH-selRow: ecx=0x%08X row=%d vt-rva=0x%X%s",
                 ecx, (int)row, vt - base,
                 (vt == base + 0x33219C) ? "  <-- matches row-container vt 0x33219C" : "");
-        else
-            Log("VEH-selRow: ecx=0x%08X row=%d vt=0x%08X (not in app.dll)", ecx, (int)row, vt);
+        else {
+            char modName[MAX_PATH] = "(unknown)"; uintptr_t modBase = 0; DWORD modSize = 0;
+            ResolveAddrToModule(vt, modName, sizeof(modName), &modBase, &modSize);
+            Log("VEH-selRow: ecx=0x%08X row=%d vt=0x%08X (not in app.dll) -> module=%s base=0x%08X size=0x%X offset=0x%X",
+                ecx, (int)row, vt, modName, (unsigned)modBase, (unsigned)modSize,
+                modBase ? (unsigned)(vt - modBase) : 0u);
+        }
     }
 }
 
@@ -3050,6 +3151,38 @@ static int ScanAllHeapForVtable(uint32_t vtbl, uint32_t* out, int maxN)
     return n;
 }
 
+static volatile uint32_t g_rescueMl = 0;
+
+static uint32_t TryHijackRescue(uint32_t base, uint32_t hijackedMl)
+{
+    if (!g_rowVtbl) return 0;
+
+    if (g_rescueMl) {
+        uint32_t rvt = 0;
+        __try { rvt = *(uint32_t*)g_rescueMl; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (rvt == g_rowVtbl) return g_rescueMl;
+        g_rescueMl = 0;
+    }
+
+    uint32_t candidates[16] = {0};
+    int n = ScanAllHeapForVtable(g_rowVtbl, candidates, 16);
+    Log("rescue: heap scan found %d candidate(s) with vt=0x%08X (hijacked ml=0x%08X)",
+        n, g_rowVtbl, hijackedMl);
+    for (int i = 0; i < n; ++i) {
+        if (candidates[i] != hijackedMl && candidates[i] != g_memberList) {
+            g_rescueMl = candidates[i];
+            Log("rescue: ml -> 0x%08X (candidate %d/%d)", g_rescueMl, i + 1, n);
+            return g_rescueMl;
+        }
+    }
+    if (n > 0) {
+        g_rescueMl = candidates[0];
+        Log("rescue: ml -> 0x%08X (only candidate; same as hijacked/captured, may not help)", g_rescueMl);
+        return g_rescueMl;
+    }
+    return 0;
+}
+
 static void DoStepAction(int step, uint32_t softkeywin, bool firstTime)
 {
     switch (step) {
@@ -3059,13 +3192,23 @@ static void DoStepAction(int step, uint32_t softkeywin, bool firstTime)
         uint32_t ml = ResolveMemberListInner(base);
         if (!ml) ml = g_memberList;
 
+        bool rescued = false;
+        if (ml && g_rowVtbl) __try {
+            uint32_t curVt = *(uint32_t*)ml;
+            if (curVt != g_rowVtbl) {
+                uint32_t fresh = TryHijackRescue(base, ml);
+                if (fresh) { ml = fresh; rescued = true; }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {   }
+
         if (ml && tgt > 0 && g_fnSelRow && g_rowVtbl) __try {
             if (*(uint32_t*)ml == g_rowVtbl) {
                 typedef void (__thiscall *SelRowFn)(void*, int, char, int);
                 SelRowFn selRow = (SelRowFn)g_fnSelRow;
                 selRow((void*)ml, tgt - 1, 1, 1);
                 Log("nav: Member List -> select-row slot %d in-proc "
-                    "(inner=0x%08X vtbl=0x%08X)%s", tgt, ml, g_rowVtbl,
+                    "(inner=0x%08X vtbl=0x%08X%s)%s", tgt, ml, g_rowVtbl,
+                    rescued ? " HIJACK-RESCUE" : "",
                     firstTime ? "" : " (retry)");
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {   }
@@ -3103,6 +3246,9 @@ static void DoStepAction(int step, uint32_t softkeywin, bool firstTime)
                 Log("nav: OTP -> RETURN (connect)");
                 PostKeyToPol(VK_RETURN); Sleep(120);
                 PostKeyToPol(VK_RETURN);
+                SecureZeroMemory(g_totpSecret, sizeof(g_totpSecret));
+                g_haveTotp = false;
+                Log("nav: TOTP seed wiped from process memory.");
                 break;
             }
         }
@@ -3258,22 +3404,51 @@ static DWORD WINAPI FrameDiscoveryThread(LPVOID)
     return 0;
 }
 
+// Helper: detect a POL dialog at *slot. Strict-vt match first; if a foreign
+// vt is present (e.g. Ashita extraslots polplugin which hooks polcore and
+// replaces dialog vtables), fall back to vt!=0 + flag-bit-set. Logs a one-
+// shot warning the first time a loose match fires per dialog (so trees.log
+// names the hook module owning the foreign vt). Returns the dialog object
+// pointer for callers that need to read further fields (softkeywin), or 0.
+static uint32_t MatchPolDialog(uint32_t slot, uint32_t expectedVt,
+                                volatile LONG* warnedOnce, const char* tag)
+{
+    uint32_t o = *(uint32_t*)slot;
+    if (!o) return 0;
+    uint32_t vt = *(uint32_t*)o;
+    bool flag = (*(uint8_t*)(o + 0xF4) & 1) != 0;
+    if (vt == expectedVt && flag) return o;
+    if (vt != 0 && flag) {
+        if (InterlockedExchange((LONG*)warnedOnce, 1) == 0) {
+            char mn[MAX_PATH] = "(unknown)"; uintptr_t mb = 0; DWORD ms = 0;
+            ResolveAddrToModule(vt, mn, sizeof(mn), &mb, &ms);
+            Log("ZeroScanMask: %s loose-matched with foreign vt=0x%08X (module=%s, base=0x%08X, offset=0x%X) — likely an Ashita polplugin hooking polcore. Accepting.",
+                tag, vt, mn, (unsigned)mb, mb ? (unsigned)(vt - mb) : 0u);
+        }
+        return o;
+    }
+    return 0;
+}
+
 static int ZeroScanMask(uint32_t base, uint32_t& softkeywin)
 {
     softkeywin = 0;
     int mask = 0;
     __try {
-        uint32_t o = *(uint32_t*)(base + 0x5069C0);
-        if (o && *(uint32_t*)o == base + 0x3CC4F4 && (*(uint8_t*)(o + 0xF4) & 1))
+        static volatile LONG warnedML = 0, warnedSC = 0, warnedSK = 0;
+        if (MatchPolDialog(base + 0x5069C0, base + 0x3CC4F4, &warnedML, "B_MEMBERLIST"))
             mask |= B_MEMBERLIST;
-        o = *(uint32_t*)(base + 0x5069C8);
-        if (o && *(uint32_t*)o == base + 0x3CCE2C && (*(uint8_t*)(o + 0xF4) & 1))
+        if (MatchPolDialog(base + 0x5069C8, base + 0x3CCE2C, &warnedSC, "B_SUBCMD"))
             mask |= B_SUBCMD;
-        o = *(uint32_t*)(base + 0x4E109C);
-        if (o && *(uint32_t*)o == base + 0x321CCC && (*(uint8_t*)(o + 0xF4) & 1)) {
+        uint32_t o = MatchPolDialog(base + 0x4E109C, base + 0x321CCC, &warnedSK, "B_SOFTKBD");
+        if (o) {
             mask |= B_SOFTKBD;
             uint32_t sk = o + 0x2A8;
-            if (*(uint32_t*)sk == base + 0x321CB8) softkeywin = sk;
+            // Strict inner-vt match preferred; if dialog's vt was already
+            // loose-matched, the inner control's vt is almost certainly
+            // also foreign, so set softkeywin unconditionally and rely on
+            // FeedSoftKbdField's __except to swallow any failures.
+            if (*(uint32_t*)sk == base + 0x321CB8 || warnedSK) softkeywin = sk;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
     return mask;
@@ -3292,12 +3467,15 @@ static DWORD WINAPI StateObserver(LPVOID)
     uint32_t base = (uint32_t)(uintptr_t)mi.lpBaseOfDll;
     Log("Navigator: %s base=0x%08X (zero-scan: per-frame globals)", (const char*)g_uiModuleName, base);
 
-    static const int NEED[5] = { 5, 4, 14, 3, 3 };
+    static const int NEED[5] = { 1, 4, 14, 3, 3 };
     int  step = 0, stable = 0, prevMask = -1;
     bool acted = false, hidden = false; int retries = 0; ULONGLONG actMs = 0;
     const ULONGLONG RETRY_MS = 1500;
     bool noHide = ReadNoHide();
     if (noHide) Log("POL window will stay VISIBLE (nohide flag set).");
+    int lastNonZeroMask = 0;
+    ULONGLONG lastNonZeroAt = GetTickCount64();
+    ULONGLONG loopStart = GetTickCount64();
     for (int tick = 0; tick < 20000 && step < 5; ++tick)
     {
         ProbeMemberListInner(base);
@@ -3319,12 +3497,35 @@ static DWORD WINAPI StateObserver(LPVOID)
 #else
         (void)hidden;
 #endif
+        if (mask != 0) { lastNonZeroMask = mask; lastNonZeroAt = GetTickCount64(); }
+
+        if (step < 3 && (mask & B_SOFTKBD) && softkeywin != 0 && !(mask & B_MEMBERLIST)) {
+            Log("nav: SKIP-DETECT — at step %d, observed SOFTKBD (mask=0x%X skw=0x%08X) "
+                "without traversing SUBCMD/PASSWORD. POL leapfrogged (likely Ashita hijack). "
+                "Fast-forwarding to step 3.", step, mask, softkeywin);
+            step = 3; acted = false; stable = 0; prevMask = -1;
+            continue;
+        }
+
         if (mask != prevMask) {
             Log("Navigator: mask=0x%X step=%d skw=0x%08X", mask, step, softkeywin);
             prevMask = mask;
         }
-        else if (tick % 200 == 0)
-            Log("Navigator: alive tick=%d mask=0x%X step=%d", tick, mask, step);
+        else if (tick % 200 == 0) {
+            HWND polH = PolWnd();
+            char ttl[80] = "(no window)";
+            int vis = 0, ico = 0, fg = 0;
+            if (polH) {
+                GetWindowTextA(polH, ttl, sizeof(ttl));
+                vis = IsWindowVisible(polH) ? 1 : 0;
+                ico = IsIconic(polH) ? 1 : 0;
+                fg = (GetForegroundWindow() == polH) ? 1 : 0;
+            }
+            DWORD elapsedSec = (DWORD)((GetTickCount64() - loopStart) / 1000);
+            DWORD sinceNzSec = (DWORD)((GetTickCount64() - lastNonZeroAt) / 1000);
+            Log("HB-TREES: tick=%d elapsed=%us mask=0x%X step=%d last_nz=0x%X (%us_ago) vis=%d ico=%d fg=%d title='%s'",
+                tick, elapsedSec, mask, step, lastNonZeroMask, sinceNzSec, vis, ico, fg, ttl);
+        }
 
         bool present =
             step==0 ? ((mask & B_MEMBERLIST) != 0) :
@@ -3396,6 +3597,12 @@ static DWORD WINAPI StateObserver(LPVOID)
                 ok ? "connect issued, awaiting login" : "ended before connect");
     if (ok) { g_hideEnabled = false; RestorePolWnd(); TeardownHooks(); }
 
+    if (g_haveTotp) {
+        SecureZeroMemory(g_totpSecret, sizeof(g_totpSecret));
+        g_haveTotp = false;
+        Log("Navigator: TOTP seed wiped from process memory (exit safety net).");
+    }
+
     if (ok) {
         CloseHandle(CreateThread(nullptr, 0, PostConnectWatchdog, nullptr, 0, nullptr));
     }
@@ -3417,6 +3624,7 @@ static DWORD WINAPI StateObserver(LPVOID)
 static DWORD WINAPI Worker(LPVOID)
 {
     Log("Trees.dll injected (stage 4a+: chain hook + HW-bp ABI capture).");
+    LogLoadedModules();
     WriteStatus("INJECTED", "helper attached");
 
     HMODULE ui = nullptr;

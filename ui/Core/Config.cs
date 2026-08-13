@@ -52,6 +52,24 @@ public sealed class Config
 
     public bool DebugLogging { get; set; } = false;
 
+    public bool AutoTerminateEnabled { get; set; } = false;
+
+    public int AutoTerminateMinutes { get; set; } = 360;
+
+    public int MinSecondsBetweenLaunches { get; set; } = 0;
+
+    public bool CheckUpdatesOnStartup { get; set; } = true;
+
+    public string? SkippedUpdateVersion { get; set; }
+
+    public string? DiagnosticsUploadUrl { get; set; }
+
+    public bool LoginBinBackupEnabled { get; set; } = true;
+
+    public int LoginBinBackupsKeep { get; set; } = 10;
+
+    public List<string> LoginBinPathOverrides { get; set; } = new();
+
     public List<string> SelectedAccounts { get; set; } = new();
 
     public List<string> AccountOrder { get; set; } = new();
@@ -148,9 +166,18 @@ public sealed class Config
         return vt.Major == vo.Major && vt.Minor == vo.Minor && vt.Build == vo.Build;
     }
 
-    public (string exe, string argsTemplate) ResolveLauncher(string? kind)
+    public (string exe, string argsTemplate) ResolveLauncher(string? kind, string? overrideExe = null)
     {
-        if (NormalizeLauncher(kind) == "Ashita")
+        var normalized = NormalizeLauncher(kind);
+        if (!string.IsNullOrWhiteSpace(overrideExe))
+        {
+            if (!File.Exists(overrideExe))
+                throw new InvalidOperationException(
+                    $"Per-account launcher exe '{overrideExe}' does not exist. " +
+                    "Edit the account and update or clear the override path.");
+            return (overrideExe!, normalized == "Ashita" ? AshitaArgs : WindowerArgs);
+        }
+        if (normalized == "Ashita")
         {
             if (string.IsNullOrWhiteSpace(AshitaExe) || !File.Exists(AshitaExe))
                 throw new InvalidOperationException(

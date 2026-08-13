@@ -14,11 +14,12 @@ public sealed class CredentialStore
         int PolSlot = 0,
         string? LaunchArgs = null,
         string? Launcher = null,
-        int IngameSlot = 0);
+        int IngameSlot = 0,
+        string? LauncherExe = null);
 
     public sealed record Account(
         string Name, string? WindowerProfile, int PolSlot, string? LaunchArgs,
-        string? Launcher, int IngameSlot);
+        string? Launcher, int IngameSlot, string? LauncherExe);
 
     private static readonly string StorePath =
         Path.Combine(AppData.Dir, "creds.dat");
@@ -43,7 +44,7 @@ public sealed class CredentialStore
     public void Set(string profile, string password, string? totpSecret,
                     string? windowerProfile = null, int polSlot = 0,
                     string? launchArgs = null, string? launcher = null,
-                    int ingameSlot = 0)
+                    int ingameSlot = 0, string? launcherExe = null)
     {
 
         _entries.TryGetValue(profile, out var prev);
@@ -54,13 +55,14 @@ public sealed class CredentialStore
             polSlot,
             launchArgs ?? prev?.LaunchArgs,
             launcher ?? prev?.Launcher,
-            ingameSlot);
+            ingameSlot,
+            launcherExe);
         Save();
     }
 
     public void SetMeta(string profile, string? windowerProfile, int polSlot,
                         string? launchArgs = null, string? launcher = null,
-                        int ingameSlot = 0)
+                        int ingameSlot = 0, string? launcherExe = null)
     {
         var e = Require(profile);
         _entries[profile] = e with
@@ -70,6 +72,7 @@ public sealed class CredentialStore
             LaunchArgs = launchArgs ?? e.LaunchArgs,
             Launcher = launcher ?? e.Launcher,
             IngameSlot = ingameSlot,
+            LauncherExe = launcherExe,
         };
         Save();
     }
@@ -87,13 +90,14 @@ public sealed class CredentialStore
     public IReadOnlyList<Account> Accounts() =>
         _entries.Select(kv => new Account(
             kv.Key, kv.Value.WindowerProfile, kv.Value.PolSlot,
-            kv.Value.LaunchArgs, kv.Value.Launcher, kv.Value.IngameSlot)).ToList();
+            kv.Value.LaunchArgs, kv.Value.Launcher, kv.Value.IngameSlot,
+            kv.Value.LauncherExe)).ToList();
 
     public Account GetAccount(string profile)
     {
         var e = Require(profile);
         return new Account(profile, e.WindowerProfile, e.PolSlot, e.LaunchArgs,
-                           e.Launcher, e.IngameSlot);
+                           e.Launcher, e.IngameSlot, e.LauncherExe);
     }
 
     public bool Remove(string profile)

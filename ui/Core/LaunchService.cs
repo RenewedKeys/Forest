@@ -22,7 +22,7 @@ public sealed class LaunchService
         _waitInject = Path.Combine(_treesDir, "waitinject.exe");
     }
 
-    public sealed record Handle(string Profile, int Pid, string StatusFile);
+    public sealed record Handle(string Profile, int Pid, string StatusFile, bool InjectOk = true);
 
     public (string state, string msg, string time) ReadStatus(Handle h)
     {
@@ -73,7 +73,7 @@ public sealed class LaunchService
                 $"'{profile}' has no POL slot. Edit it in the account dialog.");
 
         var kind = Config.NormalizeLauncher(acct.Launcher ?? _cfg.DefaultLauncher);
-        var (launcherExe, launcherArgs) = _cfg.ResolveLauncher(kind);
+        var (launcherExe, launcherArgs) = _cfg.ResolveLauncher(kind, acct.LauncherExe);
 
         var marker = (_cfg.ParallelLaunch && kind != "Ashita")
             ? "F" + Guid.NewGuid().ToString("N") : null;
@@ -88,10 +88,14 @@ public sealed class LaunchService
             haveTotp = _store.ExportEncryptedTotp(profile, totpSrc);
         }
 
+        log($"waitinject: exe='{_waitInject}' (exists={File.Exists(_waitInject)}) " +
+            $"dll='{_treesDll}' (exists={File.Exists(_treesDll)}) workdir='{_treesDir}'");
+
         var psi = new ProcessStartInfo(_waitInject)
         {
             WorkingDirectory = _treesDir,
             RedirectStandardOutput = true,
+            RedirectStandardError = true,
             UseShellExecute = false,
             CreateNoWindow = true,
         };
@@ -109,9 +113,13 @@ public sealed class LaunchService
         var wi = Process.Start(psi)
                  ?? throw new InvalidOperationException("waitinject failed to start.");
 
+        log($"waitinject: started pid={wi.Id}");
+
         InFlightWaitinjects[profile] = wi.Id;
 
         int pid = 0; bool injectOk = false;
+        int stdoutLines = 0, stderrLines = 0;
+        string lastStdout = "", lastStderr = "";
 
         try
         {
@@ -122,6 +130,7 @@ public sealed class LaunchService
                     string? line;
                     while ((line = wi.StandardOutput.ReadLine()) != null)
                     {
+                        stdoutLines++; lastStdout = line;
                         log($"[waitinject] {line}");
                         if (line.StartsWith("READY"))
                             LaunchGame(launcherExe, launcherArgs, kind,
@@ -130,13 +139,6 @@ public sealed class LaunchService
                         else if (line.StartsWith("CAPTURED_PID="))
                         {
                             int.TryParse(line.AsSpan("CAPTURED_PID=".Length), out pid);
-                            // BG-RES OVERRIDE: snapshot the FFXi registry RIGHT
-                            // NOW (Windower just wrote this profile's values)
-                            // and persist them as a per-pid sidecar that
-                            // Trees.dll reads. Later Windower launches will
-                            // clobber the registry; Trees.dll's hook then
-                            // returns OUR snapshot to FFXi instead of whatever
-                            // the (potentially-clobbered) registry holds.
                             if (_cfg.OverrideFFXiResolution &&
                                 pid > 0 && kind != "Ashita")
                             {
@@ -156,23 +158,58 @@ public sealed class LaunchService
             }) { IsBackground = true };
             pump.Start();
 
+            // Background drain of stderr so we don't lose anything waitinject
+            // might write there (currently it only uses stdout, but if AV
+            // termination or a CRT abort path kicks in it can hit stderr).
+            var errPump = new Thread(() =>
+            {
+                try
+                {
+                    string? line;
+                    while ((line = wi.StandardError.ReadLine()) != null)
+                    {
+                        stderrLines++; lastStderr = line;
+                        log($"[waitinject err] {line}");
+                    }
+                }
+                catch { }
+            }) { IsBackground = true };
+            errPump.Start();
+
             var sw = Stopwatch.StartNew();
             while (sw.Elapsed < TimeSpan.FromMinutes(5) && !wi.HasExited)
                 Thread.Sleep(200);
             pump.Join(2000);
+            errPump.Join(500);
             try { File.Delete(credSrc); } catch {  }
             try { File.Delete(totpSrc); } catch {  }
 
             if (pid == 0)
+            {
+                int exitCode = -1; try { exitCode = wi.ExitCode; } catch { }
+                log($"waitinject: exited code={exitCode} after {sw.Elapsed.TotalSeconds:F1}s, " +
+                    $"{stdoutLines} stdout line(s), {stderrLines} stderr line(s)" +
+                    (stdoutLines > 0 ? $", last stdout: '{lastStdout}'" : "") +
+                    (stderrLines > 0 ? $", last stderr: '{lastStderr}'" : ""));
+                if (stdoutLines == 0)
+                    log("waitinject: NO stdout received at all — process likely killed by AV/EDR before reaching its first printf, or stdout pipe was broken. Check Windows event log for waitinject.exe APPCRASH around this time.");
                 throw new InvalidOperationException(
                     "waitinject did not capture a new pol.exe (timeout, "
                     + "or the launch was cancelled).");
+            }
             if (!injectOk)
-                log($"WARNING: inject reported failure for pid {pid} "
-                    + "(orchestrator must run elevated). Check trees.log.");
+            {
+                bool elevated = DiagLog.IsElevated();
+                log($"WARNING: inject reported failure for pid {pid}. "
+                    + $"Forest elevated={(elevated ? "YES" : "no")}. "
+                    + (elevated
+                        ? "Forest IS already running as admin — the target (Windower/pol.exe) must be at the same or lower integrity level. Check Windower's Compatibility tab; if 'Run as administrator' is checked there, both processes are already admin, so the cause is likely antivirus/EDR blocking remote-thread creation (add Forest + Windower folders to AV exclusions)."
+                        : "Forest is NOT running as admin — if Windower is set to 'Run as administrator' (Compatibility tab), waitinject can't inject into the elevated pol.exe. Either uncheck Windower's admin compat flag, or run Forest as admin too."));
+            }
 
             return new Handle(profile, pid,
-                Path.Combine(_treesDir, $"status_{pid}.txt"));
+                Path.Combine(_treesDir, $"status_{pid}.txt"),
+                InjectOk: injectOk);
         }
         finally
         {
@@ -185,12 +222,9 @@ public sealed class LaunchService
     // and persist them as bgres_<pid>.txt next to Trees.dll. Trees.dll's
     // BgResSidecarLoaderThread picks this up async and uses it to override
     // future reads inside pol.exe — so concurrent Windower launches can
-    // clobber the registry freely without affecting this pol.exe's render.
-    //
-    // The keys we capture (DWORD values): 0001, 0002, 0003, 0004, 0037, 0038
-    //   0001/0002 = window width/height
-    //   0003/0004 = render width/height (background resolution)
-    //   0037/0038 = menu/UI resolution
+    // Captures every "NNNN" 4-digit DWORD value under the FFXi key so any
+    // per-profile display setting Windower writes is preserved across
+    // multi-launch clobber. Trees.dll's hook is generic.
     private void WriteBgResSidecar(int pid, Action<string> log)
     {
         using var key = Microsoft.Win32.RegistryKey.OpenBaseKey(
@@ -203,8 +237,14 @@ public sealed class LaunchService
             return;
         }
         var lines = new List<string>();
-        foreach (var name in new[] { "0001", "0002", "0003", "0004", "0037", "0038" })
+        foreach (var name in ffxi.GetValueNames())
         {
+            // Only 4-digit numeric slots (0000-NNNN); skip Cafe, padmode000, etc.
+            if (name.Length != 4) continue;
+            bool allDigits = true;
+            for (int i = 0; i < 4; i++) if (name[i] < '0' || name[i] > '9') { allDigits = false; break; }
+            if (!allDigits) continue;
+
             var v = ffxi.GetValue(name);
             if (v is int iv) lines.Add($"{name}={(uint)iv}");
             else if (v is long lv) lines.Add($"{name}={(uint)lv}");

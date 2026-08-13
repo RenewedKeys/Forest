@@ -7,7 +7,7 @@
 // In a plain browser (dev preview, no WebView2) every call is served by an
 // in-memory MOCK so the whole UI is usable without the C# host.
 
-import type { Account, AccountSave, AccountStatus, Config, StaleProc } from './types';
+import type { Account, AccountSave, AccountStatus, Config, DiagUploadResult, PolBackupDiscovery, PolBackupEntry, PolRestoreResult, StaleProc, UpdateSnapshot } from './types';
 import { DEMO, demoAccounts, demoConfig, demoStatuses } from './demo';
 
 type Pending = { resolve: (v: unknown) => void; reject: (e: unknown) => void };
@@ -64,8 +64,22 @@ export const api = {
   statusAll:        () => call<AccountStatus[]>('status.all'),
   launch:           (profiles: string[]) => call<void>('launch', { profiles }),
   terminate:        (profiles: string[]) => call<void>('terminate', { profiles }),
+  setManualTerminate:   (profile: string, seconds: number) => call<void>('account.setManualTerminate', { profile, seconds }),
+  clearManualTerminate: (profile: string) => call<void>('account.clearManualTerminate', { profile }),
   browse:           (kind: 'file' | 'dir', filter?: string) => call<string>('browse', { kind, filter }),
   exportDiag:       () => call<string>('diagnostics.export'),
+  uploadDiag:       (label: string) => call<DiagUploadResult>('diagnostics.upload', { label }),
+  recheckClock:     () => call<{ clockSkewSeconds: number | null }>('diagnostics.recheckClock'),
+  polBackupDiscover: () => call<PolBackupDiscovery>('polbackup.discover'),
+  polBackupRunNow:   () => call<void>('polbackup.runNow'),
+  polBackupOpenDir:  () => call<void>('polbackup.openDir'),
+  polBackupList:     () => call<PolBackupEntry[]>('polbackup.list'),
+  polBackupRestore:  (backupPath: string, targetPath: string) => call<PolRestoreResult>('polbackup.restore', { backupPath, targetPath }),
+  updateSnapshot:   () => call<UpdateSnapshot>('update.snapshot'),
+  updateCheck:      () => call<void>('update.check'),
+  updateInstall:    () => call<void>('update.install'),
+  updateSkip:       (version: string) => call<void>('update.skip', { version }),
+  updateDismiss:    () => call<void>('update.dismiss'),
   openLogs:         () => call<void>('logs.open'),
   proxyRunning:     () => call<boolean>('polproxy.status'),
   scanStale:        () => call<StaleProc[]>('cleanup.scan'),
@@ -102,14 +116,26 @@ const mockConfig: Config = {
   overrideFFXiResolution: true,
   launchMode: 'Full',
   debugLogging: false,
+  autoTerminateEnabled: false,
+  autoTerminateMinutes: 360,
+  minSecondsBetweenLaunches: 0,
+  checkUpdatesOnStartup: true,
+  skippedUpdateVersion: '',
+  diagnosticsUploadUrl: '',
+  currentVersion: '1.2.11',
+  clockSkewSeconds: null,
+  loginBinBackupEnabled: true,
+  loginBinBackupsKeep: 10,
+  loginBinPathOverrides: [],
   selectedAccounts: [],
   accountOrder: ['Tank', 'Healer', 'Shinchan'],
+  isElevated: false,
 };
 
 let mockAccounts: Account[] = [
-  { profile: 'Tank',     windower: 'Box',  polSlot: 1, ingameSlot: 1, launcher: 'Windower', launchArgs: '', hasTotp: false },
-  { profile: 'Healer',   windower: 'Box',  polSlot: 2, ingameSlot: 1, launcher: 'Windower', launchArgs: '', hasTotp: false },
-  { profile: 'Shinchan', windower: 'Main', polSlot: 3, ingameSlot: 1, launcher: 'Ashita',   launchArgs: '', hasTotp: true },
+  { profile: 'Tank',     windower: 'Box',  polSlot: 1, ingameSlot: 1, launcher: 'Windower', launchArgs: '', launcherExe: '', hasTotp: false },
+  { profile: 'Healer',   windower: 'Box',  polSlot: 2, ingameSlot: 1, launcher: 'Windower', launchArgs: '', launcherExe: '', hasTotp: false },
+  { profile: 'Shinchan', windower: 'Main', polSlot: 3, ingameSlot: 1, launcher: 'Ashita',   launchArgs: '', launcherExe: '', hasTotp: true },
 ];
 const mockStatus = new Map<string, AccountStatus>(
   mockAccounts.map((a) => [a.profile, { profile: a.profile, pid: 0, status: 'INACTIVE' as const }]),
@@ -142,7 +168,9 @@ function mockCall<T>(method: string, params?: unknown): Promise<T> {
       const a = p as AccountSave;
       const key = a.originalProfile ?? a.profile;
       const idx = mockAccounts.findIndex((x) => x.profile === key);
-      const next: Account = { profile: a.profile, windower: a.windower, polSlot: a.polSlot, ingameSlot: a.ingameSlot, launcher: a.launcher, launchArgs: a.launchArgs, hasTotp: !!a.totpSecret };
+      const prevHasTotp = idx >= 0 ? mockAccounts[idx].hasTotp : false;
+      const hasTotp = a.clearTotp ? false : (!!a.totpSecret || prevHasTotp);
+      const next: Account = { profile: a.profile, windower: a.windower, polSlot: a.polSlot, ingameSlot: a.ingameSlot, launcher: a.launcher, launchArgs: a.launchArgs, launcherExe: a.launcherExe ?? '', hasTotp };
       if (idx >= 0) mockAccounts[idx] = next; else mockAccounts.push(next);
       if (!mockStatus.has(a.profile)) mockStatus.set(a.profile, { profile: a.profile, pid: 0, status: 'INACTIVE' });
       return delay(undefined);
@@ -154,6 +182,17 @@ function mockCall<T>(method: string, params?: unknown): Promise<T> {
     case 'terminate': { (p.profiles as string[]).forEach((pf) => mockStatus.set(pf, { profile: pf, pid: 0, status: 'TERMINATED' })); emit('status', [...mockStatus.values()]); return delay(undefined); }
     case 'browse': return delay('C:\\Mock\\Selected\\Path');
     case 'diagnostics.export': return delay('C:\\Users\\you\\Desktop\\Forest-Diagnostics-mock.zip');
+    case 'diagnostics.upload': return delay({ ok: true, id: 'mock-' + Math.floor(Math.random() * 9999), url: null, error: null });
+    case 'update.snapshot': return delay({
+      desktop: { kind: 'idle' as const },
+      currentVersion: '1.2.11',
+      checkOnStartup: true,
+      lastCheckIso: null,
+    });
+    case 'update.check': return delay(undefined);
+    case 'update.install': return delay(undefined);
+    case 'update.skip': return delay(undefined);
+    case 'update.dismiss': return delay(undefined);
     case 'logs.open': return delay(undefined);
     case 'polproxy.status': return delay(mockConfig.usePolProxy);
     case 'cleanup.scan': return delay([]);

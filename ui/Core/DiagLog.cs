@@ -1,6 +1,7 @@
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 
@@ -13,6 +14,16 @@ internal static class DiagLog
     public static readonly string SessionFile =
         Path.Combine(Dir, $"forest-{DateTime.Now:yyyyMMdd-HHmmss}.log");
 
+    public static bool IsElevated()
+    {
+        try
+        {
+            using var id = WindowsIdentity.GetCurrent();
+            return new WindowsPrincipal(id).IsInRole(WindowsBuiltInRole.Administrator);
+        }
+        catch { return false; }
+    }
+
     public static bool Verbose;
 
     public static string AppVersion =>
@@ -24,9 +35,50 @@ internal static class DiagLog
         try
         {
             Directory.CreateDirectory(Dir);
+            WriteReadme();
             Prune();
             File.AppendAllText(SessionFile,
-                $"[{DateTime.Now:HH:mm:ss.fff}] === Forest session start (v{AppVersion}) ===\r\n");
+                $"[{DateTime.Now:HH:mm:ss.fff}] === Forest session start (v{AppVersion}, elevated={(IsElevated() ? "YES" : "no")}) ===\r\n");
+        }
+        catch {  }
+    }
+
+    private const string ReadmeBody =
+        "===============================================================================\r\n" +
+        "  DO NOT SEND THE RAW LOG FILES IN THIS FOLDER TO ANYONE.\r\n" +
+        "===============================================================================\r\n" +
+        "\r\n" +
+        "These files (forest-YYYYMMDD-HHMMSS.log, trees.log) contain your Windows\r\n" +
+        "username, your Forest account/character names, and your Windower profile\r\n" +
+        "names in plaintext. Sharing them directly leaks PII you probably do not\r\n" +
+        "want public.\r\n" +
+        "\r\n" +
+        "To send diagnostics to the developer:\r\n" +
+        "\r\n" +
+        "  1. Open Forest\r\n" +
+        "  2. Go to Settings -> DIAGNOSTICS\r\n" +
+        "  3. Click 'Upload Diagnostics'\r\n" +
+        "  4. Enter your Discord handle (or any short label) so the developer\r\n" +
+        "     knows the upload is from you\r\n" +
+        "  5. Click Upload\r\n" +
+        "\r\n" +
+        "That flow packages the same content, but scrubs your username +\r\n" +
+        "account/character/profile names first (ACCOUNT_1, ACCOUNT_2, USER, etc.)\r\n" +
+        "so it is safe to share.\r\n" +
+        "\r\n" +
+        "The 'Export Diagnostics' button in the same section does the same scrub\r\n" +
+        "but saves the zip to your Desktop instead of uploading it, in case you\r\n" +
+        "want to attach it to Discord/email yourself.\r\n" +
+        "\r\n" +
+        "===============================================================================\r\n";
+
+    private static void WriteReadme()
+    {
+        try
+        {
+            var path = Path.Combine(Dir, "README-DONT-SEND-THESE.txt");
+            var existing = File.Exists(path) ? File.ReadAllText(path) : "";
+            if (existing != ReadmeBody) File.WriteAllText(path, ReadmeBody);
         }
         catch {  }
     }
@@ -85,6 +137,7 @@ internal static class DiagLog
             sb.AppendLine($"Forest version  : {AppVersion}");
             sb.AppendLine($"OS              : {Environment.OSVersion}  ({(Environment.Is64BitOperatingSystem ? "x64" : "x86")})");
             sb.AppendLine($".NET            : {Environment.Version}");
+            sb.AppendLine($"Elevated        : {(IsElevated() ? "YES (admin)" : "no")}");
             sb.AppendLine($"AppData         : {AppData.Dir}");
             string resolvedTreesDir;
             try { resolvedTreesDir = cfg.ResolveTreesDir(); }

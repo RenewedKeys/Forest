@@ -27,7 +27,27 @@ public sealed class WebBridge
     private readonly ConcurrentDictionary<string, byte> _cancelled = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<int, DateTime> _proxyServed = new();
     private readonly Dictionary<int, DateTime> _doneSince = new();
+    private readonly Dictionary<string, DateTime> _runningSince = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _runningSeen = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> _reattached = new(StringComparer.OrdinalIgnoreCase);
+    // Per-profile manual ad-hoc termination timer: absolute UTC time to KillRow.
+    private readonly Dictionary<string, (DateTime At, int TotalSeconds)> _manualTermAt = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, int> _wrongPwFailCount = new(StringComparer.OrdinalIgnoreCase);
+
+    private sealed class PidDiag
+    {
+        public string LastState = "";
+        public string LastNonInjectedState = "";
+        public DateTime LastStateChangeAt = DateTime.UtcNow;
+        public DateTime LastHeartbeatAt = DateTime.MinValue;
+        public TimeSpan LastCpu = TimeSpan.Zero;
+        public DateTime LastCpuAt = DateTime.MinValue;
+        public bool StuckTcpDumped = false;
+        public int  FfxiClientStreak = 0;
+        public bool FfxiClientSeen = false;
+    }
+    private readonly Dictionary<int, PidDiag> _pidDiag = new();
+
     private bool _launching;
 
     // ── Splash / auto-quit state ─────────────────────────────────────────────
@@ -74,6 +94,36 @@ public sealed class WebBridge
 
         _timer.Tick += (_, _) => Poll();
         _timer.Start();
+
+        UpdateManager.Instance.StateChanged += OnUpdateStateChanged;
+        _window.Closed += (_, _) => { try { UpdateManager.Instance.StateChanged -= OnUpdateStateChanged; } catch { } };
+    }
+
+    private void OnUpdateStateChanged()
+    {
+        try { _ui.BeginInvoke(new Action(() => Emit("update.state", UpdateSnapshotDto()))); }
+        catch { }
+    }
+
+    private static object UpdateSnapshotDto()
+    {
+        var s = UpdateManager.Instance.Snapshot();
+        return new
+        {
+            desktop = new
+            {
+                kind       = s.Desktop.Kind,
+                version    = s.Desktop.Version,
+                notes      = s.Desktop.Notes,
+                url        = s.Desktop.Url,
+                downloaded = s.Desktop.Downloaded,
+                total      = s.Desktop.Total,
+                message    = s.Desktop.Message,
+            },
+            currentVersion = s.CurrentVersion,
+            checkOnStartup = s.CheckOnStartup,
+            lastCheckIso   = s.LastCheckIso,
+        };
     }
 
     private void OnFastServed(int pid) =>
@@ -128,9 +178,113 @@ public sealed class WebBridge
             case "status.all": Reply(id, true, Snapshot(), null); break;
             case "launch": Launch(p.GetProperty("profiles").EnumerateArray().Select(x => x.GetString()!).ToArray()); Reply(id, true, null, null); break;
             case "terminate": Terminate(p.GetProperty("profiles").EnumerateArray().Select(x => x.GetString()!).ToArray()); Reply(id, true, null, null); break;
+            case "account.setManualTerminate":
+                SetManualTerminate(p.GetProperty("profile").GetString() ?? "", p.GetProperty("seconds").GetInt32());
+                Reply(id, true, null, null); EmitStatus(); break;
+            case "account.clearManualTerminate":
+                ClearManualTerminate(p.GetProperty("profile").GetString() ?? "");
+                Reply(id, true, null, null); EmitStatus(); break;
 
             case "browse": Reply(id, true, Browse(p), null); break;
             case "diagnostics.export": Reply(id, true, ExportDiag(), null); break;
+            case "polbackup.discover":
+            {
+                var cfg = Config.Load();
+                var found = LoginBinBackup.DiscoverPaths(cfg)
+                    .Select(c => new { path = c.Path, source = c.Source, exists = File.Exists(c.Path) })
+                    .ToArray();
+                Reply(id, true, new { paths = found, backupDir = LoginBinBackup.GetBackupDir() }, null);
+                break;
+            }
+            case "polbackup.runNow":
+            {
+                Task.Run(() =>
+                {
+                    try { LoginBinBackup.RunBackup(Config.Load()); }
+                    catch (Exception ex) { DiagLog.Log("polbackup.runNow failed: " + ex.Message); }
+                    _ui.BeginInvoke(new Action(() => Reply(id, true, null, null)));
+                });
+                break;
+            }
+            case "polbackup.openDir":
+            {
+                try
+                {
+                    Directory.CreateDirectory(LoginBinBackup.GetBackupDir());
+                    Process.Start(new ProcessStartInfo { FileName = LoginBinBackup.GetBackupDir(), UseShellExecute = true });
+                }
+                catch (Exception ex) { DiagLog.Log("polbackup.openDir failed: " + ex.Message); }
+                Reply(id, true, null, null); break;
+            }
+            case "polbackup.list":
+            {
+                var cfg = Config.Load();
+                var entries = LoginBinBackup.ListBackups(cfg).Select(b => new {
+                    backupPath = b.BackupPath,
+                    targetPath = b.TargetPath,
+                    targetSource = b.TargetSource,
+                    createdUtc = b.CreatedUtc.ToString("o"),
+                    sizeBytes = b.SizeBytes,
+                    isPreRestoreEmergency = b.IsPreRestoreEmergency,
+                }).ToArray();
+                Reply(id, true, entries, null); break;
+            }
+            case "polbackup.restore":
+            {
+                string bp = p.TryGetProperty("backupPath", out var bpv) && bpv.ValueKind == JsonValueKind.String ? bpv.GetString() ?? "" : "";
+                string tp = p.TryGetProperty("targetPath", out var tpv) && tpv.ValueKind == JsonValueKind.String ? tpv.GetString() ?? "" : "";
+                if (string.IsNullOrWhiteSpace(bp) || string.IsNullOrWhiteSpace(tp))
+                { Reply(id, false, null, "missing backupPath or targetPath"); break; }
+                Task.Run(() =>
+                {
+                    var r = LoginBinBackup.Restore(Config.Load(), bp, tp);
+                    _ui.BeginInvoke(new Action(() => Reply(id, true, new {
+                        ok = r.Ok,
+                        emergencyBackupPath = r.EmergencyBackupPath,
+                        error = r.Error,
+                    }, null)));
+                });
+                break;
+            }
+            case "diagnostics.recheckClock":
+                Task.Run(async () =>
+                {
+                    try { await Diagnostics.LogClockSkewAsync().ConfigureAwait(false); }
+                    catch { }
+                    _ui.BeginInvoke(new Action(() =>
+                    {
+                        Reply(id, true, new { clockSkewSeconds = Diagnostics.LastClockSkewSeconds }, null);
+                    }));
+                });
+                break;
+            case "diagnostics.upload":
+            {
+                string label = p.ValueKind == JsonValueKind.Object && p.TryGetProperty("label", out var lv)
+                    && lv.ValueKind == JsonValueKind.String
+                    ? lv.GetString() ?? "" : "";
+                Task.Run(async () =>
+                {
+                    var r = await DiagnosticsUploader.UploadAsync(label).ConfigureAwait(false);
+                    _ui.BeginInvoke(new Action(() => Reply(id, true,
+                        new { ok = r.Ok, id = r.Id, url = r.Url, error = r.Error }, null)));
+                });
+                break;
+            }
+            case "update.snapshot": Reply(id, true, UpdateSnapshotDto(), null); break;
+            case "update.check":
+                Task.Run(async () => { try { await UpdateManager.Instance.CheckAsync(respectSkip: false); } catch { } });
+                Reply(id, true, null, null); break;
+            case "update.install":
+                Task.Run(async () => { try { await UpdateManager.Instance.InstallAsync(); } catch { } });
+                Reply(id, true, null, null); break;
+            case "update.skip":
+            {
+                string ver = p.ValueKind == JsonValueKind.Object && p.TryGetProperty("version", out var vv)
+                    && vv.ValueKind == JsonValueKind.String ? vv.GetString() ?? "" : "";
+                if (!string.IsNullOrWhiteSpace(ver)) UpdateManager.Instance.Skip(ver);
+                Reply(id, true, null, null); break;
+            }
+            case "update.dismiss": UpdateManager.Instance.Dismiss(); Reply(id, true, null, null); break;
             case "logs.open": OpenLogs(); Reply(id, true, null, null); break;
             case "polproxy.status": Reply(id, true, PolProxy.Running, null); break;
             case "cleanup.scan": Reply(id, true, ScanStale(), null); break;
@@ -184,8 +338,22 @@ public sealed class WebBridge
         overrideFFXiResolution = c.OverrideFFXiResolution,
         launchMode = c.LaunchMode ?? "Full",
         debugLogging = c.DebugLogging,
+        autoTerminateEnabled = c.AutoTerminateEnabled,
+        autoTerminateMinutes = c.AutoTerminateMinutes,
+        minSecondsBetweenLaunches = c.MinSecondsBetweenLaunches,
+        checkUpdatesOnStartup = c.CheckUpdatesOnStartup,
+        skippedUpdateVersion = c.SkippedUpdateVersion ?? "",
+        diagnosticsUploadUrl = c.DiagnosticsUploadUrl ?? "",
+        currentVersion = UpdateManager.GetCurrentVersion(),
+        clockSkewSeconds = Diagnostics.LastClockSkewSeconds,
+        loginBinBackupEnabled = c.LoginBinBackupEnabled,
+        loginBinBackupsKeep = c.LoginBinBackupsKeep,
+        loginBinPathOverrides = c.LoginBinPathOverrides,
         selectedAccounts = c.SelectedAccounts,
         accountOrder = c.AccountOrder,
+        // Read-only: whether the Forest process is running with admin rights.
+        // Not part of Config; just exposed via the same DTO for convenience.
+        isElevated = DiagLog.IsElevated(),
     };
 
     private void ApplyConfigPatch(JsonElement p)
@@ -224,6 +392,20 @@ public sealed class WebBridge
                     break;
                 }
                 case "debugLogging": c.DebugLogging = prop.Value.GetBoolean(); break;
+                case "autoTerminateEnabled": c.AutoTerminateEnabled = prop.Value.GetBoolean(); break;
+                case "autoTerminateMinutes": c.AutoTerminateMinutes = Math.Max(1, prop.Value.GetInt32()); break;
+                case "minSecondsBetweenLaunches": c.MinSecondsBetweenLaunches = Math.Max(0, Math.Min(120, prop.Value.GetInt32())); break;
+                case "checkUpdatesOnStartup": c.CheckUpdatesOnStartup = prop.Value.GetBoolean(); break;
+                case "diagnosticsUploadUrl": c.DiagnosticsUploadUrl = E(prop.Value.GetString()); break;
+                case "loginBinBackupEnabled": c.LoginBinBackupEnabled = prop.Value.GetBoolean(); break;
+                case "loginBinBackupsKeep": c.LoginBinBackupsKeep = Math.Max(1, Math.Min(50, prop.Value.GetInt32())); break;
+                case "loginBinPathOverrides":
+                    c.LoginBinPathOverrides = prop.Value.EnumerateArray()
+                        .Select(x => x.GetString() ?? "")
+                        .Where(s => !string.IsNullOrWhiteSpace(s))
+                        .Select(s => s.Trim())
+                        .ToList();
+                    break;
                 case "selectedAccounts": c.SelectedAccounts = prop.Value.EnumerateArray().Select(x => x.GetString()!).ToList(); break;
                 case "accountOrder": c.AccountOrder = prop.Value.EnumerateArray().Select(x => x.GetString()!).ToList(); break;
             }
@@ -254,6 +436,7 @@ public sealed class WebBridge
                          : string.Equals(t.a.Launcher, "Windower", StringComparison.OrdinalIgnoreCase) ? "Windower"
                          : "Default",
                 launchArgs = t.a.LaunchArgs ?? "",
+                launcherExe = t.a.LauncherExe ?? "",
                 hasTotp = store.HasTotp(t.a.Name),
             })
             .ToArray();
@@ -268,8 +451,12 @@ public sealed class WebBridge
         var original = p.TryGetProperty("originalProfile", out var ov) && ov.ValueKind == JsonValueKind.String ? ov.GetString() : null;
         var windower = string.IsNullOrWhiteSpace(Get("windower")) ? null : Get("windower").Trim();
         var args = string.IsNullOrWhiteSpace(Get("launchArgs")) ? null : Get("launchArgs").Trim();
+        var launcherExe = string.IsNullOrWhiteSpace(Get("launcherExe")) ? null : Get("launcherExe").Trim();
         var pw = Get("password");
         var totp = string.IsNullOrWhiteSpace(Get("totpSecret")) ? null : Get("totpSecret").Trim();
+        bool clearTotp = p.TryGetProperty("clearTotp", out var ctv)
+            && ctv.ValueKind == JsonValueKind.True;
+        if (clearTotp) totp = null;
         int slot = GetInt("polSlot");
         int ingame = GetInt("ingameSlot");
         var launcherRaw = Get("launcher");
@@ -292,14 +479,20 @@ public sealed class WebBridge
         if (!editing)
         {
             if (string.IsNullOrEmpty(pw)) throw new InvalidOperationException("SE password is required for a new account.");
-            store.Set(profile, pw, totp, windower, slot, args, launcher, ingame);
+            store.Set(profile, pw, totp, windower, slot, args, launcher, ingame, launcherExe);
         }
         else if (!string.IsNullOrEmpty(pw))
-            store.Set(profile, pw, totp, windower, slot, args, launcher, ingame);
+            store.Set(profile, pw, totp, windower, slot, args, launcher, ingame, launcherExe);
         else
-            store.SetMeta(profile, windower, slot, args, launcher, ingame);
+            store.SetMeta(profile, windower, slot, args, launcher, ingame, launcherExe);
 
         if (editing && totp != null) store.SetTotp(profile, totp);
+
+        if (editing && clearTotp)
+        {
+            store.SetTotp(profile, null);
+            DiagLog.Log($"[{profile}] stored OTP secret cleared");
+        }
 
         // Bug fix: when renaming, migrate the old name to the new name in every
         // place keyed by profile name so (a) display order is preserved, (b) the
@@ -307,6 +500,23 @@ public sealed class WebBridge
         // lost (running pol.exe -> INACTIVE was caused by _handles/_state keying
         // by profile name, not pid).
         if (renaming) MigrateProfileKey(original!, profile);
+    }
+
+    private void SetManualTerminate(string profile, int seconds)
+    {
+        if (string.IsNullOrWhiteSpace(profile) || seconds <= 0) return;
+        if (!_handles.ContainsKey(profile)) return;
+        _manualTermAt[profile] = (DateTime.UtcNow.AddSeconds(seconds), seconds);
+        _runningSince.Remove(profile);
+        DiagLog.Log($"[{profile}] manual-terminate timer set: {seconds}s (auto-terminate suppressed)");
+    }
+
+    private void ClearManualTerminate(string profile)
+    {
+        bool clearedManual = _manualTermAt.Remove(profile);
+        bool clearedAuto   = _runningSince.Remove(profile);
+        if (clearedManual || clearedAuto)
+            DiagLog.Log($"[{profile}] timer cleared (manual={clearedManual}, auto={clearedAuto})");
     }
 
     private void MigrateProfileKey(string oldName, string newName)
@@ -376,8 +586,51 @@ public sealed class WebBridge
         return s;
     }
 
-    private object[] Snapshot() =>
-        _state.Select(kv => (object)new { profile = kv.Key, pid = kv.Value.Pid, status = kv.Value.Status }).ToArray();
+    private object[] Snapshot()
+    {
+        Config cfg;
+        try { cfg = Config.Load(); } catch { cfg = new Config(); }
+        var selectedSet = new HashSet<string>(cfg.SelectedAccounts, StringComparer.OrdinalIgnoreCase);
+        var atEnabled = cfg.AutoTerminateEnabled && cfg.AutoTerminateMinutes > 0;
+        var totalSec = cfg.AutoTerminateMinutes * 60;
+
+        return _state.Select(kv =>
+        {
+            int? countdownSeconds = null;
+            int? countdownTotalSeconds = null;
+            string? countdownSource = null;
+            bool isRunning = string.Equals(kv.Value.Status, "RUNNING", StringComparison.OrdinalIgnoreCase);
+
+            if (atEnabled && isRunning && selectedSet.Contains(kv.Key)
+                && _runningSince.TryGetValue(kv.Key, out var since))
+            {
+                var left = totalSec - (int)(DateTime.UtcNow - since).TotalSeconds;
+                countdownSeconds = Math.Max(0, left);
+                countdownTotalSeconds = totalSec;
+                countdownSource = "auto";
+            }
+            if (isRunning && _manualTermAt.TryGetValue(kv.Key, out var manual))
+            {
+                var manualLeft = Math.Max(0, (int)(manual.At - DateTime.UtcNow).TotalSeconds);
+                if (countdownSeconds is null || manualLeft < countdownSeconds.Value)
+                {
+                    countdownSeconds = manualLeft;
+                    countdownTotalSeconds = manual.TotalSeconds;
+                    countdownSource = "manual";
+                }
+            }
+
+            return (object)new
+            {
+                profile = kv.Key,
+                pid = kv.Value.Pid,
+                status = kv.Value.Status,
+                countdownSeconds,
+                countdownTotalSeconds,
+                countdownSource,
+            };
+        }).ToArray();
+    }
 
     private void EmitStatus() => Emit("status", Snapshot());
 
@@ -414,13 +667,61 @@ public sealed class WebBridge
 
             if (!PolAlive(h.Pid))
             {
+                uint? exitCode = Diagnostics.GetExitCode(h.Pid);
+                string exitTag = exitCode.HasValue
+                    ? $"exit_code=0x{exitCode.Value:X8} ({exitCode.Value})"
+                    : "exit_code=unavailable";
+                string cause = wrongPw ? "WRONG_SE_PASSWORD" : stuckPost ? "LOGIN_STUCK" : "EXITED";
+                DiagLog.Log($"POL-GONE [{profile}] pid={h.Pid} cause={cause} {exitTag}");
+
                 Set(profile, wrongPw ? "WRONG SE PASSWORD" : stuckPost ? "LOGIN STUCK" : "TERMINATED", 0);
                 _handles.TryRemove(profile, out _);
                 _noAuto.TryRemove(profile, out _);
                 _proxyServed.Remove(h.Pid);
                 _doneSince.Remove(h.Pid);
+                _pidDiag.Remove(h.Pid);
+                _runningSince.Remove(profile);
+                _manualTermAt.Remove(profile);
                 continue;
             }
+
+            HeartbeatAndStuckCheck(profile, h.Pid, state);
+
+            bool ffxiClient = false;
+            try
+            {
+                using var modProc = Process.GetProcessById(h.Pid);
+                foreach (System.Diagnostics.ProcessModule m in modProc.Modules)
+                {
+                    if (string.Equals(m.ModuleName, "FFXiMain.dll", StringComparison.OrdinalIgnoreCase))
+                    { ffxiClient = true; break; }
+                }
+            }
+            catch { }
+            if (_pidDiag.TryGetValue(h.Pid, out var pdClient))
+            {
+                if (ffxiClient)
+                {
+                    pdClient.FfxiClientStreak++;
+                    if (!pdClient.FfxiClientSeen && pdClient.FfxiClientStreak >= 3)
+                    {
+                        pdClient.FfxiClientSeen = true;
+                        DiagLog.Log($"[{profile}] FFXiMain.dll loaded in pol.exe (streak=3); POL login confirmed. Promoting to IN_GAME regardless of Trees.dll status.");
+                    }
+                }
+                else pdClient.FfxiClientStreak = 0;
+
+                if (pdClient.FfxiClientSeen)
+                {
+                    _doneSince.Remove(h.Pid);
+                    if (!string.Equals(StatOf(profile).Status, "RUNNING", StringComparison.OrdinalIgnoreCase))
+                        Set(profile, "RUNNING", h.Pid);
+                    if (_autoQuitArmed && _autoQuitWatching.Contains(profile))
+                        _inGameSeen.Add(profile);
+                    continue;
+                }
+            }
+
             if (wrongPw) { Set(profile, "WRONG SE PASSWORD", h.Pid); continue; }
             if (stuckPost) { Set(profile, "LOGIN STUCK", h.Pid); continue; }
             if (_noAuto.ContainsKey(profile)) { Set(profile, "RUNNING", h.Pid); continue; }
@@ -453,10 +754,13 @@ public sealed class WebBridge
                     _doneSince[h.Pid] = DateTime.UtcNow;
                 else if ((DateTime.UtcNow - _doneSince[h.Pid]).TotalSeconds > InGameTimeoutSeconds)
                 {
-                    DiagLog.Log($"[{profile}] DONE→IN_GAME timeout after {InGameTimeoutSeconds}s; terminating stuck client");
                     _doneSince.Remove(h.Pid);
-                    KillRow(profile);
-                    Set(profile, "TIMEOUT", 0);
+                    DiagLog.Log($"[{profile}] DONE→IN_GAME timeout after {InGameTimeoutSeconds}s; " +
+                                "Trees.dll never confirmed in-game (sig-scan may have missed party global). " +
+                                "NOT terminating pol.exe — leaving it running. Marking as LOGIN STUCK for visibility. " +
+                                "If FFXiMain.dll subsequently loads in the pol.exe process, we'll auto-promote to RUNNING.");
+                    Set(profile, "LOGIN STUCK", h.Pid);
+                    StatOf(profile).TermAt = null;
                     continue;
                 }
             }
@@ -468,6 +772,62 @@ public sealed class WebBridge
 
         foreach (var kv in _state)
             if (kv.Value.Status == "RUNNING") _wrongPwFailCount.Remove(kv.Key);
+
+        // Auto-terminate. Timers only ever start at the FRESH transition into
+        // RUNNING (Forest just watched the account log in) AND only when the
+        // setting was enabled at that moment. Currently-running accounts are
+        // never touched by toggling the setting — they're not in _runningSince
+        // (no timer was ever set for them), so they don't get a countdown badge
+        // and they can't be terminated. Reattached pol processes (from before
+        // this Forest session) are also never eligible — flagged in _reattached.
+        var selectedSet = new HashSet<string>(cfg.SelectedAccounts, StringComparer.OrdinalIgnoreCase);
+        var atEnabled = cfg.AutoTerminateEnabled && cfg.AutoTerminateMinutes > 0;
+        var atDelay = TimeSpan.FromMinutes(cfg.AutoTerminateMinutes);
+
+        if (!atEnabled) _runningSince.Clear();
+
+        foreach (var (profile, h) in _handles.ToArray())
+        {
+            var status = StatOf(profile).Status;
+            bool isRunning = string.Equals(status, "RUNNING", StringComparison.OrdinalIgnoreCase);
+            if (!isRunning)
+            {
+                _runningSeen.Remove(profile);
+                _runningSince.Remove(profile);
+                continue;
+            }
+            bool firstSeen = _runningSeen.Add(profile);
+            if (firstSeen && atEnabled && selectedSet.Contains(profile) && !_reattached.Contains(profile))
+            {
+                _runningSince[profile] = DateTime.UtcNow;
+            }
+            if (atEnabled && _runningSince.TryGetValue(profile, out var since)
+                && DateTime.UtcNow - since >= atDelay)
+            {
+                DiagLog.Log($"[{profile}] auto-terminate after {cfg.AutoTerminateMinutes}m");
+                _runningSince.Remove(profile);
+                _runningSeen.Remove(profile);
+                KillRow(profile);
+            }
+        }
+        foreach (var prof in _runningSince.Keys.ToArray())
+            if (!_handles.ContainsKey(prof)) _runningSince.Remove(prof);
+        foreach (var prof in _runningSeen.ToArray())
+            if (!_handles.ContainsKey(prof)) _runningSeen.Remove(prof);
+        foreach (var prof in _reattached.ToArray())
+            if (!_handles.ContainsKey(prof)) _reattached.Remove(prof);
+
+        // Manual ad-hoc termination timers (set per-row from the UI).
+        foreach (var (profile, entry) in _manualTermAt.ToArray())
+        {
+            if (!_handles.ContainsKey(profile)) { _manualTermAt.Remove(profile); continue; }
+            if (DateTime.UtcNow >= entry.At)
+            {
+                DiagLog.Log($"[{profile}] manual-terminate timer fired");
+                _manualTermAt.Remove(profile);
+                KillRow(profile);
+            }
+        }
 
         if (_autoQuitArmed)
         {
@@ -623,6 +983,70 @@ public sealed class WebBridge
         catch { return false; }
     }
 
+    private void HeartbeatAndStuckCheck(string profile, int pid, string rawState)
+    {
+        if (!_pidDiag.TryGetValue(pid, out var pd))
+        {
+            pd = new PidDiag { LastState = rawState };
+            _pidDiag[pid] = pd;
+        }
+
+        bool changed = !string.Equals(rawState, pd.LastState, StringComparison.OrdinalIgnoreCase);
+        if (changed)
+        {
+            var sincePrev = (int)(DateTime.UtcNow - pd.LastStateChangeAt).TotalSeconds;
+            DiagLog.Log($"STATE [{profile}] pid={pid} '{pd.LastState}' -> '{rawState}' (held {sincePrev}s)");
+            if (!string.IsNullOrEmpty(pd.LastState) &&
+                !pd.LastState.Equals("INJECTED", StringComparison.OrdinalIgnoreCase))
+                pd.LastNonInjectedState = pd.LastState;
+            pd.LastState = rawState;
+            pd.LastStateChangeAt = DateTime.UtcNow;
+            pd.StuckTcpDumped = false;
+        }
+
+        bool inGame = rawState.Equals("IN_GAME", StringComparison.OrdinalIgnoreCase);
+        var sinceHb = (DateTime.UtcNow - pd.LastHeartbeatAt).TotalSeconds;
+        if (sinceHb >= 5 && !inGame)
+        {
+            string title = "(?)"; int threads = -1; double cpuPct = -1;
+            try
+            {
+                using var proc = Process.GetProcessById(pid);
+                title = proc.MainWindowTitle ?? "";
+                threads = proc.Threads.Count;
+                var cpuNow = proc.TotalProcessorTime;
+                var nowUtc = DateTime.UtcNow;
+                if (pd.LastCpuAt != DateTime.MinValue)
+                {
+                    var elapsedMs = (nowUtc - pd.LastCpuAt).TotalMilliseconds;
+                    var cpuMs = (cpuNow - pd.LastCpu).TotalMilliseconds;
+                    if (elapsedMs > 0)
+                        cpuPct = Math.Round(cpuMs / elapsedMs * 100.0 / Math.Max(1, Environment.ProcessorCount), 1);
+                }
+                pd.LastCpu = cpuNow;
+                pd.LastCpuAt = nowUtc;
+            }
+            catch { }
+
+            int sinceChangeSec = (int)(DateTime.UtcNow - pd.LastStateChangeAt).TotalSeconds;
+            string lastNz = string.IsNullOrEmpty(pd.LastNonInjectedState) ? "(none)" : pd.LastNonInjectedState;
+            string cpuStr = cpuPct < 0 ? "?" : $"{cpuPct}%";
+            string titleStr = string.IsNullOrEmpty(title) ? "(empty)" : title.Length > 60 ? title.Substring(0, 60) + "..." : title;
+            DiagLog.Log($"HB [{profile}] pid={pid} state={rawState} held={sinceChangeSec}s last_nz='{lastNz}' title='{titleStr}' cpu={cpuStr} threads={threads}");
+            pd.LastHeartbeatAt = DateTime.UtcNow;
+        }
+
+        int stuckSec = (int)(DateTime.UtcNow - pd.LastStateChangeAt).TotalSeconds;
+        if (stuckSec >= 60 && !inGame && !pd.StuckTcpDumped)
+        {
+            pd.StuckTcpDumped = true;
+            DiagLog.Log($"STUCK [{profile}] pid={pid} state='{rawState}' for {stuckSec}s — dumping TCP connections");
+            int capturedPid = pid;
+            string capturedProfile = profile;
+            Task.Run(() => Diagnostics.DumpTcpConnections(capturedProfile, capturedPid));
+        }
+    }
+
     // ── launch / terminate ──────────────────────────────────────────────────────
     private bool IsInFlight(string p) => _handles.ContainsKey(p) || InFlightStates.Contains(StatOf(p).Status);
     private bool IsLaunchable(string p) => !IsInFlight(p) && Relaunchable.Contains(StatOf(p).Status);
@@ -652,8 +1076,15 @@ public sealed class WebBridge
         if (launch.Count == 0) return;
 
         LaunchService svc;
-        try { svc = new LaunchService(Config.Load(), CredentialStore.Load()); }
+        Config cfgForBackup;
+        try { cfgForBackup = Config.Load(); svc = new LaunchService(cfgForBackup, CredentialStore.Load()); }
         catch (Exception ex) { Emit("notice", new { level = "error", title = "CONFIGURATION", message = ex.Message }); return; }
+
+        Task.Run(() =>
+        {
+            try { LoginBinBackup.RunBackup(cfgForBackup); }
+            catch (Exception ex) { DiagLog.Log("Launch: login_w.bin pre-backup failed: " + ex.Message); }
+        });
 
         _launching = true;
         foreach (var p in launch) { _cancelled.TryRemove(p, out _); Set(p, "QUEUED", 0); }
@@ -680,6 +1111,20 @@ public sealed class WebBridge
                 bool noAuto = c.DisableAutoLogin && !c.HidePolWindow;
                 if (noAuto) _noAuto[p] = 1; else _noAuto.TryRemove(p, out _);
                 _ui.Invoke(() => { _proxyServed.Remove(h.Pid); _doneSince.Remove(h.Pid); Set(p, noAuto ? "RUNNING" : "LAUNCH POL", h.Pid); EmitStatus(); });
+                if (!h.InjectOk)
+                {
+                    bool elev = DiagLog.IsElevated();
+                    string msg = elev
+                        ? "Forest IS running as admin, so the target pol.exe is at a higher integrity level — likely an antivirus / EDR is blocking remote-thread creation. Add the Forest folder + %LOCALAPPDATA%\\Forest\\bin\\ + your Windower folder to your AV exclusions and try again."
+                        : "Forest is NOT running as admin. If Windower is set to \"Run as administrator\" (right-click Windower.exe → Properties → Compatibility), waitinject cannot inject into the elevated pol.exe. Either uncheck Windower's admin compat flag, or run Forest as admin too — both must match.";
+                    _ui.Invoke(() => Emit("notice", new
+                    {
+                        id = $"inject-fail-{p}-{h.Pid}",
+                        level = "error",
+                        title = $"Trees.dll injection failed for {p}",
+                        message = msg,
+                    }));
+                }
             }
             catch (Exception ex)
             {
@@ -696,9 +1141,44 @@ public sealed class WebBridge
                 var cfg = Config.Load();
                 bool fast = cfg.FastSequential;
                 bool noAuto = cfg.DisableAutoLogin && !cfg.HidePolWindow;
+                // Auto-detected shared-OTP cooldown. Keyed by SHA-256 of the
+                // decrypted TOTP secret so we can detect collisions without
+                // ever logging or persisting the secret itself. If two
+                // launches share an OTP and the cooldown is configured > 0,
+                // the second one waits before LaunchOne so the TOTP code has
+                // rotated + SE's anti-replay window has elapsed.
+                var otpLastUsedAt = new Dictionary<string, DateTime>(StringComparer.Ordinal);
+                var credStore = CredentialStore.Load();
+                string TotpHash(string profile)
+                {
+                    try
+                    {
+                        var s = credStore.GetTotpSecret(profile);
+                        if (string.IsNullOrEmpty(s)) return "";
+                        var b = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(s));
+                        return Convert.ToHexString(b);
+                    }
+                    catch { return ""; }
+                }
+
                 for (int i = 0; i < launch.Count; i++)
                 {
+                    var otpHash = TotpHash(launch[i]);
+                    if (cfg.MinSecondsBetweenLaunches > 0 && otpHash.Length > 0
+                        && otpLastUsedAt.TryGetValue(otpHash, out var lastUsed))
+                    {
+                        var elapsed = (DateTime.UtcNow - lastUsed).TotalSeconds;
+                        var remaining = cfg.MinSecondsBetweenLaunches - elapsed;
+                        if (remaining > 0)
+                        {
+                            DiagLog.Log($"[{launch[i]}] OTP cooldown: shared TOTP secret detected, waiting {remaining:F1}s (configured spacing = {cfg.MinSecondsBetweenLaunches}s)");
+                            Thread.Sleep(TimeSpan.FromSeconds(remaining));
+                        }
+                    }
+
                     LaunchOne(launch[i]);
+                    if (otpHash.Length > 0) otpLastUsedAt[otpHash] = DateTime.UtcNow;
+
                     if (i >= launch.Count - 1) break;
                     if (noAuto)
                     {
@@ -757,9 +1237,26 @@ public sealed class WebBridge
 
     private void Terminate(string[] profiles)
     {
-        bool any = false;
-        foreach (var p in profiles) any |= KillRow(p);
-        if (any) EmitStatus();
+        if (profiles.Length == 0) return;
+        if (profiles.Length == 1)
+        {
+            if (KillRow(profiles[0])) EmitStatus();
+            return;
+        }
+        var batch = profiles.ToArray();
+        Task.Run(() =>
+        {
+            bool any = false;
+            DiagLog.Log($"terminate: serializing {batch.Length} kills with 1s spacing (POL account-file safety)");
+            for (int i = 0; i < batch.Length; i++)
+            {
+                if (i > 0) Thread.Sleep(1000);
+                bool killed = false;
+                _ui.Invoke(() => { killed = KillRow(batch[i]); if (killed) EmitStatus(); });
+                any |= killed;
+            }
+            if (any) _ui.BeginInvoke(new Action(EmitStatus));
+        });
     }
 
     private bool KillRow(string profile)
@@ -804,7 +1301,7 @@ public sealed class WebBridge
         if (!killed) return false;
         _handles.TryRemove(profile, out _);
         _noAuto.TryRemove(profile, out _);
-        if (polPid > 0) { _proxyServed.Remove(polPid); _doneSince.Remove(polPid); }
+        if (polPid > 0) { _proxyServed.Remove(polPid); _doneSince.Remove(polPid); _pidDiag.Remove(polPid); }
         Set(profile, "TERMINATED", 0);
         return true;
     }
@@ -858,6 +1355,7 @@ public sealed class WebBridge
 
                 _handles[profile] = new LaunchService.Handle(profile, pid, Path.Combine(dir, $"status_{pid}.txt"));
                 _noAuto[profile] = 1;
+                _reattached.Add(profile);
                 Set(profile, "RUNNING", pid);
             }
         }

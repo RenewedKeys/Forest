@@ -8,9 +8,9 @@ import { api, subscribe } from './bridge';
 import { syncScrollbarFromVar } from './scrollbar';
 import { useTheme } from './theme';
 import { DEMO, demoSelection } from './demo';
-import type { Account, AccountStatus, Config } from './types';
+import type { Account, AccountStatus, Config, UpdateSnapshot } from './types';
 
-const VERSION = '1.2.4';
+const VERSION = '1.2.11';
 type Tab = 'home' | 'settings';
 
 export default function App() {
@@ -39,6 +39,7 @@ function FullApp() {
   const [statuses, setStatuses] = useState<Record<string, AccountStatus>>({});
   const [selected, setSelected] = useState<Set<string>>(() => DEMO ? new Set(demoSelection) : new Set());
   const [selHydrated, setSelHydrated] = useState(DEMO);
+  const [notices, setNotices] = useState<Notice[]>([]);
 
   useEffect(() => { syncScrollbarFromVar(); }, [theme]);
 
@@ -64,8 +65,11 @@ function FullApp() {
     api.getConfig().then(setConfigState);
     refreshAccounts();
     api.statusAll().then((l) => setStatuses(Object.fromEntries(l.map((s) => [s.profile, s]))));
-    return subscribe('status', (l: AccountStatus[]) =>
+    const u1 = subscribe('status', (l: AccountStatus[]) =>
       setStatuses(Object.fromEntries(l.map((s) => [s.profile, s]))));
+    const u2 = subscribe('notice', (n: Notice) =>
+      setNotices((prev) => prev.find((x) => x.id === n.id) ? prev : [...prev, n]));
+    return () => { u1(); u2(); };
   }, [refreshAccounts]);
 
   // Hydrate the checkbox selection from config.selectedAccounts on the
@@ -115,6 +119,16 @@ function FullApp() {
         </div>
       </div>
 
+      <UpdateBanner />
+
+      {notices.length > 0 && (
+        <div className="shrink-0 flex flex-col gap-1 px-3 pt-2">
+          {notices.map((n) => (
+            <NoticeBanner key={n.id} notice={n} onDismiss={() => setNotices((prev) => prev.filter((x) => x.id !== n.id))} />
+          ))}
+        </div>
+      )}
+
       <main className="flex-1 min-h-0">
         <div key={tab} className="le-view h-full">
           {tab === 'home'
@@ -122,6 +136,75 @@ function FullApp() {
             : <Settings config={config} patchConfig={patchConfig} />}
         </div>
       </main>
+    </div>
+  );
+}
+
+interface Notice { id: string; level: 'error' | 'warning' | 'info'; title: string; message: string; }
+
+function NoticeBanner({ notice, onDismiss }: { notice: Notice; onDismiss: () => void }) {
+  const tone =
+    notice.level === 'error'   ? 'bg-red-500/15 border-red-500/50 text-red-100'
+    : notice.level === 'warning' ? 'bg-amber-500/15 border-amber-500/50 text-amber-100'
+                                 : 'bg-sky-500/15 border-sky-500/50 text-sky-100';
+  return (
+    <div className={`flex items-start gap-2 rounded-md border px-3 py-2 text-[12px] ${tone}`}>
+      <div className="flex-1 min-w-0">
+        <div className="font-bold tracking-wide">{notice.title}</div>
+        <div className="text-fg-2 mt-0.5 leading-snug">{notice.message}</div>
+      </div>
+      <button onClick={onDismiss} aria-label="Dismiss"
+        className="shrink-0 grid place-items-center w-6 h-6 rounded text-fg-3 hover:text-white hover:bg-black/30 transition-colors">✕</button>
+    </div>
+  );
+}
+
+function UpdateBanner() {
+  const [snap, setSnap] = useState<UpdateSnapshot | null>(null);
+  const [dismissed, setDismissed] = useState<Set<string>>(new Set());
+
+  useEffect(() => {
+    api.updateSnapshot().then(setSnap).catch(() => {});
+    return subscribe('update.state', (s: UpdateSnapshot) => setSnap(s));
+  }, []);
+
+  if (!snap) return null;
+  const d = snap.desktop;
+  const ver = d.version ?? '';
+  const showAvailable = d.kind === 'available' && ver && !dismissed.has(ver);
+  const showProgress = d.kind === 'downloading' || d.kind === 'installing' || d.kind === 'installed';
+  if (!showAvailable && !showProgress) return null;
+
+  const pct = d.total && d.total > 0 ? Math.min(100, Math.round(((d.downloaded ?? 0) / d.total) * 100)) : null;
+
+  return (
+    <div className="shrink-0 mx-3 mt-2 rounded-md border border-emerald-500/40 bg-emerald-500/8 px-3 py-1.5 flex items-center gap-2.5 text-[12px]">
+      <svg viewBox="0 0 24 24" className="w-4 h-4 shrink-0 text-emerald-300" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+        <path d="M12 5v14" /><path d="m19 12-7 7-7-7" />
+      </svg>
+      <div className="flex-1 min-w-0 text-fg-2">
+        {showAvailable && (
+          <>Forest <span className="font-bold text-fg">v{ver}</span> is available <span className="text-fg-4">(you're on v{snap.currentVersion})</span></>
+        )}
+        {d.kind === 'downloading' && (
+          <>Downloading v{ver}… <span className="tabular-nums text-fg-3">{pct !== null ? `${pct}%` : ''}</span></>
+        )}
+        {d.kind === 'installing' && <>Installing v{ver}…</>}
+        {d.kind === 'installed' && <>Update staged. Forest will restart automatically.</>}
+      </div>
+      {showAvailable && (
+        <div className="flex items-center gap-1 shrink-0">
+          <button
+            onClick={() => api.updateInstall()}
+            className="text-[11px] font-semibold rounded px-2.5 py-1 bg-emerald-500/70 hover:bg-emerald-500 text-white transition-colors"
+          >Install</button>
+          <button
+            onClick={() => setDismissed((prev) => new Set([...prev, ver]))}
+            className="text-[11px] font-semibold rounded px-2 py-1 text-fg-3 hover:text-fg hover:bg-fg/10 transition-colors"
+            aria-label="Dismiss update notice"
+          >Dismiss</button>
+        </div>
+      )}
     </div>
   );
 }

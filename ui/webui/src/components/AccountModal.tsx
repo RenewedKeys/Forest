@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { Modal } from '../widgets';
 import { Button, RowStacked, Segmented, Select, TextField } from '../ui';
 import { api } from '../bridge';
+import { ConfirmModal, type ConfirmOpts } from './ConfirmModal';
 import type { Account, Config, Launcher } from '../types';
 
 function PasswordField({ value, onChange, placeholder }: { value: string; onChange: (v: string) => void; placeholder?: string }) {
@@ -31,8 +32,11 @@ export function AccountModal({ account, accounts, config, onClose, onSaved }:
   const [polSlot, setPolSlot] = useState(account?.polSlot ? String(account.polSlot) : '1');
   const [ingameSlot, setIngameSlot] = useState(account?.ingameSlot ? String(account.ingameSlot) : '1');
   const [args, setArgs] = useState(account?.launchArgs ?? '');
+  const [launcherExe, setLauncherExe] = useState(account?.launcherExe ?? '');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
+  const [clearTotp, setClearTotp] = useState(false);
+  const [confirm, setConfirm] = useState<ConfirmOpts | null>(null);
 
   const effective = launcher === 'Default' ? (config?.defaultLauncher ?? 'Windower') : launcher;
   const profileLabel = effective === 'Ashita' ? 'Ashita Boot Config (.ini)' : 'Windower Profile';
@@ -67,8 +71,10 @@ export function AccountModal({ account, accounts, config, onClose, onSaved }:
         ingameSlot: Number(ingameSlot) || 1,
         launcher,
         launchArgs: args.trim(),
+        launcherExe: launcherExe.trim() || undefined,
         password: password || undefined,
-        totpSecret: totp.replace(/\s/g, '') || undefined,
+        totpSecret: clearTotp ? undefined : (totp.replace(/\s/g, '') || undefined),
+        clearTotp: clearTotp || undefined,
       });
       onSaved();
       onClose();
@@ -79,6 +85,8 @@ export function AccountModal({ account, accounts, config, onClose, onSaved }:
   }
 
   return (
+    <>
+    <ConfirmModal opts={confirm} onClose={() => setConfirm(null)} />
     <Modal
       open
       width={460}
@@ -100,11 +108,89 @@ export function AccountModal({ account, accounts, config, onClose, onSaved }:
           <PasswordField value={password} onChange={setPassword} placeholder={editing ? '•••••••• (unchanged)' : 'SE password'} />
         </RowStacked>
         <RowStacked label="(OTP) SE Account Software Authenticator Setup Key" desc="OTP Password setup key provided to you when registering a Software Authenticator to your SE Account.">
-          <PasswordField value={totp} onChange={setTotp} placeholder={editing && account?.hasTotp ? '•••••••• (stored)' : 'e.g. 2323 EOFK 23KER 7Z2M ...'} />
+          <div className="flex items-stretch gap-1.5">
+            <div className="flex-1 min-w-0">
+              <PasswordField
+                value={totp}
+                onChange={(v) => { setTotp(v); if (v) setClearTotp(false); }}
+                placeholder={clearTotp
+                  ? 'stored OTP will be cleared on save'
+                  : (editing && account?.hasTotp
+                      ? '•••••••• (stored)'
+                      : 'e.g. 2323 EOFK 23KER 7Z2M ...')}
+              />
+            </div>
+            {editing && account?.hasTotp && !clearTotp && (
+              <button
+                type="button"
+                title="Remove stored OTP"
+                aria-label="Remove stored OTP"
+                onClick={() => setConfirm({
+                  title: 'Remove stored OTP?',
+                  message: (
+                    <>
+                      This will erase the stored authenticator secret for <span className="font-semibold text-fg">{account.profile}</span>.
+                      Future launches will not auto-fill an OTP code until you add a new setup key.
+                      <br /><br />
+                      The change is applied when you click <span className="font-semibold text-fg">Save</span>.
+                    </>
+                  ),
+                  confirmText: 'Remove OTP',
+                  danger: true,
+                  onConfirm: () => { setClearTotp(true); setTotp(''); },
+                })}
+                className="px-2.5 rounded-md border border-red-500/40 bg-red-500/10 text-red-300 hover:bg-red-500/20 hover:text-red-200 transition-colors"
+              >
+                <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 6h18" /><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+                  <path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6" />
+                  <path d="M10 11v6" /><path d="M14 11v6" />
+                </svg>
+              </button>
+            )}
+            {clearTotp && (
+              <button
+                type="button"
+                onClick={() => setClearTotp(false)}
+                className="px-2.5 rounded-md border border-line bg-surface-raised text-fg-3 hover:text-fg-2 text-[11px] font-semibold"
+              >
+                Undo
+              </button>
+            )}
+          </div>
+          {editing && account?.hasTotp && !clearTotp && (
+            <div
+              title="An OTP secret is currently stored for this account"
+              aria-label="OTP stored"
+              className="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-bold tracking-wider text-emerald-200 bg-emerald-500/15 border border-emerald-400/40"
+            >
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="8" cy="15" r="4" />
+                <path d="M10.85 12.15 19 4" /><path d="M18 5l2 2" /><path d="M15 8l2 2" />
+              </svg>
+              OTP STORED
+            </div>
+          )}
+          {clearTotp && (
+            <div className="mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-md text-[11px] font-bold tracking-wider text-amber-200 bg-amber-500/15 border border-amber-400/40">
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10" /><path d="M12 8v4" /><path d="M12 16h.01" />
+              </svg>
+              WILL BE CLEARED ON SAVE
+            </div>
+          )}
         </RowStacked>
         <RowStacked label="Launcher" desc="Per-account launcher; Default uses the global setting.">
           <Segmented<Launcher> full value={launcher} onChange={setLauncher}
             options={[{ v: 'Default', label: 'Default' }, { v: 'Windower', label: 'Windower' }, { v: 'Ashita', label: 'Ashita v4' }]} />
+        </RowStacked>
+        <RowStacked
+          label={`Custom ${effective} Executable (optional)`}
+          desc={`Override the global ${effective} path for this account only. Blank uses the global Settings path.`}>
+          <div className="flex gap-1.5">
+            <TextField value={launcherExe} onChange={setLauncherExe} placeholder="blank = use global Settings path" />
+            <Button onClick={async () => { const p = await api.browse('file', 'exe'); if (p) setLauncherExe(p); }}>Browse</Button>
+          </div>
         </RowStacked>
         <RowStacked label={profileLabel} desc={effective === 'Ashita' ? 'Ashita boot config (.ini). Blank uses default.ini.' : 'Windower profile name. Blank uses Default Profile.'}>
           <TextField value={windower} onChange={setWindower} placeholder={effective === 'Ashita' ? 'default.ini' : 'Default Profile'} />
@@ -130,5 +216,6 @@ export function AccountModal({ account, accounts, config, onClose, onSaved }:
         </RowStacked>
       </div>
     </Modal>
+    </>
   );
 }
