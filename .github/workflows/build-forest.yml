@@ -1,0 +1,403 @@
+# Builds Forest from the exact source commit that was security-reviewed
+# (d1e0178 of github.com/suspiciousman3187/Forest), with the auto-updater
+# removed. Run it from the Actions tab -> "Build Forest (reviewed)" -> Run workflow.
+# The finished zip appears under "Artifacts" at the bottom of the run page.
+
+name: Build Forest (reviewed)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  UPSTREAM: https://github.com/suspiciousman3187/Forest.git
+  COMMIT: d1e017820a294c73d2b54991f12f763bb4e3c9ec
+  DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Install .NET 9 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Download the reviewed commit and verify it
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir src && cd src
+          git init -q .
+          git config core.autocrlf false
+          git remote add origin "$UPSTREAM"
+          git fetch -q --depth 1 origin "$COMMIT"
+          git checkout -q FETCH_HEAD
+          head=$(git rev-parse HEAD)
+          if [ "$head" != "$COMMIT" ]; then echo "Commit mismatch: $head"; exit 1; fi
+          echo "Source is exactly commit $head"
+
+      - name: Remove the auto-updater
+        shell: bash
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cat > ../remove-updater.patch <<'PATCH_EOF'
+          diff --git a/ui/Core/Config.cs b/ui/Core/Config.cs
+          index ffa1087..4970828 100644
+          --- a/ui/Core/Config.cs
+          +++ b/ui/Core/Config.cs
+          @@ -58,7 +58,7 @@ public sealed class Config
+           
+               public int MinSecondsBetweenLaunches { get; set; } = 0;
+           
+          -    public bool CheckUpdatesOnStartup { get; set; } = true;
+          +    public bool CheckUpdatesOnStartup { get; set; } = false;
+           
+               public string? SkippedUpdateVersion { get; set; }
+           
+          diff --git a/ui/Core/DesktopUpdater.cs b/ui/Core/DesktopUpdater.cs
+          deleted file mode 100644
+          index e1157a5..0000000
+          --- a/ui/Core/DesktopUpdater.cs
+          +++ /dev/null
+          @@ -1,89 +0,0 @@
+          -using System.Diagnostics;
+          -using System.IO;
+          -using System.IO.Compression;
+          -using System.Reflection;
+          -using System.Windows;
+          -
+          -namespace Forest;
+          -
+          -public static class DesktopUpdater
+          -{
+          -    public static void StageAndLaunch(string zipPath, string version)
+          -    {
+          -        if (!File.Exists(zipPath))
+          -            throw new InvalidOperationException("Downloaded zip not found: " + zipPath);
+          -
+          -        string installDir = AppDomain.CurrentDomain.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar);
+          -        string exePath    = Process.GetCurrentProcess().MainModule?.FileName
+          -                            ?? Assembly.GetExecutingAssembly().Location;
+          -
+          -        string baseDir = Path.Combine(
+          -            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+          -            "Forest", "updates");
+          -        string stagingDir = Path.Combine(baseDir, "stage-" + version);
+          -        if (Directory.Exists(stagingDir)) Directory.Delete(stagingDir, true);
+          -        Directory.CreateDirectory(stagingDir);
+          -
+          -        ZipFile.ExtractToDirectory(zipPath, stagingDir);
+          -
+          -        string root = FindStagingRoot(stagingDir);
+          -
+          -        string cmdPath = Path.Combine(baseDir, "forest-update-" + version + ".cmd");
+          -        int pid = Process.GetCurrentProcess().Id;
+          -
+          -        string script =
+          -            "@echo off\r\n" +
+          -            "setlocal\r\n" +
+          -            "set PID=" + pid + "\r\n" +
+          -            "set SRC=" + Quote(root) + "\r\n" +
+          -            "set DST=" + Quote(installDir) + "\r\n" +
+          -            "set EXE=" + Quote(exePath) + "\r\n" +
+          -            ":wait\r\n" +
+          -            "tasklist /FI \"PID eq %PID%\" 2>NUL | find /I \"%PID%\" >NUL\r\n" +
+          -            "if not errorlevel 1 (\r\n" +
+          -            "  timeout /t 1 /nobreak >NUL\r\n" +
+          -            "  goto wait\r\n" +
+          -            ")\r\n" +
+          -            "robocopy %SRC% %DST% /E /R:2 /W:1 /NFL /NDL /NJH /NJS >NUL\r\n" +
+          -            "start \"\" %EXE%\r\n" +
+          -            "rmdir /S /Q %SRC% >NUL 2>NUL\r\n" +
+          -            "del \"%~f0\"\r\n";
+          -
+          -        File.WriteAllText(cmdPath, script);
+          -
+          -        var psi = new ProcessStartInfo
+          -        {
+          -            FileName        = "cmd.exe",
+          -            Arguments       = "/c \"" + cmdPath + "\"",
+          -            CreateNoWindow  = true,
+          -            UseShellExecute = false,
+          -            WindowStyle     = ProcessWindowStyle.Hidden,
+          -        };
+          -        Process.Start(psi);
+          -
+          -        ThreadPool.QueueUserWorkItem(_ =>
+          -        {
+          -            Thread.Sleep(750);
+          -            try
+          -            {
+          -                Application.Current?.Dispatcher?.Invoke(() => Application.Current.Shutdown());
+          -            }
+          -            catch { Environment.Exit(0); }
+          -        });
+          -    }
+          -
+          -    private static string FindStagingRoot(string stagingDir)
+          -    {
+          -        if (File.Exists(Path.Combine(stagingDir, "Forest.exe")))
+          -            return stagingDir;
+          -        foreach (string sub in Directory.GetDirectories(stagingDir))
+          -        {
+          -            if (File.Exists(Path.Combine(sub, "Forest.exe")))
+          -                return sub;
+          -        }
+          -        throw new InvalidOperationException(
+          -            "Forest.exe not found in extracted zip - the zip layout is unexpected.");
+          -    }
+          -
+          -    private static string Quote(string p) => "\"" + p + "\"";
+          -}
+          diff --git a/ui/Core/UpdateManager.cs b/ui/Core/UpdateManager.cs
+          index e2bc580..ec5a344 100644
+          --- a/ui/Core/UpdateManager.cs
+          +++ b/ui/Core/UpdateManager.cs
+          @@ -10,9 +10,6 @@ namespace Forest;
+           
+           public sealed class UpdateManager
+           {
+          -    public const string ManifestUrl =
+          -        "https://github.com/suspiciousman3187/Forest/releases/latest/download/manifest.json";
+          -
+               private static UpdateManager? _instance;
+               public static UpdateManager Instance => _instance ??= new UpdateManager();
+           
+          @@ -108,112 +105,21 @@ public sealed class UpdateManager
+                   return false;
+               }
+           
+          -    public async Task CheckAsync(bool respectSkip)
+          +    // Self-built copy: the auto-updater is removed. Updates from the developer's
+          +    // release would replace this build with an unverified binary, so this copy
+          +    // never contacts GitHub and never downloads or installs anything.
+          +    public Task CheckAsync(bool respectSkip)
+               {
+                   lock (_sync)
+                   {
+          -            if (_desktop.Kind is "checking" or "downloading" or "installing") return;
+          -            _desktop = new ChannelState { Kind = "checking" };
+          -        }
+          -        Bump();
+          -
+          -        Manifest? manifest;
+          -        try
+          -        {
+          -            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
+          -            using var client = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+          -            client.DefaultRequestHeaders.Add("User-Agent", "Forest-Updater");
+          -            string body = await client.GetStringAsync(ManifestUrl).ConfigureAwait(false);
+          -            manifest = JsonSerializer.Deserialize<Manifest>(body,
+          -                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+          -            if (manifest == null) throw new InvalidOperationException("manifest deserialized to null");
+          -        }
+          -        catch (Exception ex)
+          -        {
+          -            lock (_sync) _desktop = new ChannelState { Kind = "error", Message = "Failed to fetch manifest: " + ex.Message };
+          -            DiagLog.Log("UpdateManager check failed: " + ex.Message);
+          -            Bump();
+          -            return;
+          -        }
+          -
+          -        lock (_sync) _lastCheck = DateTime.UtcNow;
+          -        string current = GetCurrentVersion();
+          -        var cfg = Config.Load();
+          -
+          -        lock (_sync)
+          -        {
+          -            if (manifest.Desktop != null && IsNewer(manifest.Desktop.Version, current))
+          -            {
+          -                if (respectSkip && string.Equals(manifest.Desktop.Version, cfg.SkippedUpdateVersion, StringComparison.OrdinalIgnoreCase))
+          -                    _desktop = new ChannelState { Kind = "none" };
+          -                else
+          -                {
+          -                    _desktop = new ChannelState
+          -                    {
+          -                        Kind    = "available",
+          -                        Version = manifest.Desktop.Version,
+          -                        Notes   = manifest.Desktop.Notes,
+          -                        Url     = manifest.Desktop.Url,
+          -                    };
+          -                    DiagLog.Log($"UpdateManager: v{manifest.Desktop.Version} available (current v{current})");
+          -                }
+          -            }
+          -            else _desktop = new ChannelState { Kind = "none" };
+          +            _lastCheck = DateTime.UtcNow;
+          +            _desktop = new ChannelState { Kind = "none" };
+                   }
+                   Bump();
+          +        return Task.CompletedTask;
+               }
+           
+          -    public async Task InstallAsync()
+          -    {
+          -        ManifestEntry target;
+          -        lock (_sync)
+          -        {
+          -            if (_desktop.Kind != "available") return;
+          -            target = new ManifestEntry { Version = _desktop.Version, Url = _desktop.Url };
+          -            _desktop = new ChannelState { Kind = "downloading", Version = target.Version, Downloaded = 0, Total = null };
+          -        }
+          -        Bump();
+          -
+          -        string zipPath;
+          -        try
+          -        {
+          -            zipPath = await DownloadWithProgress(target.Url!, (downloaded, total) =>
+          -            {
+          -                lock (_sync)
+          -                {
+          -                    if (_desktop.Kind == "downloading")
+          -                    {
+          -                        _desktop.Downloaded = downloaded;
+          -                        _desktop.Total = total;
+          -                    }
+          -                }
+          -                Bump();
+          -            }).ConfigureAwait(false);
+          -        }
+          -        catch (Exception ex)
+          -        {
+          -            lock (_sync) _desktop = new ChannelState { Kind = "error", Message = "Download failed: " + ex.Message };
+          -            DiagLog.Log("UpdateManager download failed: " + ex.Message);
+          -            Bump();
+          -            return;
+          -        }
+          -
+          -        lock (_sync) _desktop = new ChannelState { Kind = "installing", Version = target.Version };
+          -        Bump();
+          -
+          -        try
+          -        {
+          -            DesktopUpdater.StageAndLaunch(zipPath, target.Version!);
+          -            lock (_sync) _desktop = new ChannelState { Kind = "installed", Version = target.Version };
+          -            Bump();
+          -        }
+          -        catch (Exception ex)
+          -        {
+          -            lock (_sync) _desktop = new ChannelState { Kind = "error", Message = "Install failed: " + ex.Message };
+          -            DiagLog.Log("UpdateManager install failed: " + ex.Message);
+          -            Bump();
+          -        }
+          -    }
+          +    public Task InstallAsync() => Task.CompletedTask;
+           
+               public void Skip(string version)
+               {
+          @@ -234,46 +140,6 @@ public sealed class UpdateManager
+                   Bump();
+               }
+           
+          -    private async Task<string> DownloadWithProgress(string url, Action<long, long?>? onProgress)
+          -    {
+          -        string dir = Path.Combine(
+          -            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+          -            "Forest", "updates");
+          -        Directory.CreateDirectory(dir);
+          -        string name = SafeName(url) ?? ("update-" + Guid.NewGuid().ToString("N") + ".zip");
+          -        string path = Path.Combine(dir, name);
+          -
+          -        ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12 | SecurityProtocolType.Tls13;
+          -        using var client = new HttpClient { Timeout = TimeSpan.FromMinutes(10) };
+          -        client.DefaultRequestHeaders.Add("User-Agent", "Forest-Updater");
+          -        using var resp = await client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false);
+          -        resp.EnsureSuccessStatusCode();
+          -        long? total = resp.Content.Headers.ContentLength;
+          -        using var src = await resp.Content.ReadAsStreamAsync().ConfigureAwait(false);
+          -        using var dst = File.Create(path);
+          -        byte[] buf = new byte[81920];
+          -        long downloaded = 0;
+          -        int n;
+          -        while ((n = await src.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false)) > 0)
+          -        {
+          -            await dst.WriteAsync(buf, 0, n).ConfigureAwait(false);
+          -            downloaded += n;
+          -            onProgress?.Invoke(downloaded, total);
+          -        }
+          -        return path;
+          -    }
+          -
+          -    private static string? SafeName(string url)
+          -    {
+          -        try
+          -        {
+          -            var u = new Uri(url);
+          -            string n = Path.GetFileName(u.LocalPath);
+          -            return string.IsNullOrEmpty(n) ? null : n;
+          -        }
+          -        catch { return null; }
+          -    }
+          -
+               public static string Sha256Hex(string path)
+               {
+                   using var sha = SHA256.Create();
+          PATCH_EOF
+          git apply --whitespace=nowarn ../remove-updater.patch
+          test ! -e ui/Core/DesktopUpdater.cs
+          if grep -q HttpClient ui/Core/UpdateManager.cs; then echo "updater still present"; exit 1; fi
+          echo "Updater removed"
+
+      - name: Build Trees.dll and waitinject.exe (32-bit)
+        shell: pwsh
+        working-directory: src/trees
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+          if (-not $vs) { throw "Visual C++ tools not found" }
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars32.bat'
+          $bat = @"
+          @echo off
+          call "$vcvars" >nul || exit /b 1
+          rc /nologo /fo Trees.res Trees.rc || exit /b 1
+          cl /nologo /LD /O2 /MT /EHsc /W3 /DNDEBUG Trees.cpp Trees.res /Fe:Trees.dll /Fo:Trees.obj /link /SUBSYSTEM:WINDOWS || exit /b 1
+          cl /nologo /O2 /MT /EHsc /W3 /DNDEBUG waitinject.cpp /Fe:waitinject.exe /Fo:waitinject.obj || exit /b 1
+          del *.obj *.exp *.lib *.res >nul 2>nul
+          exit /b 0
+          "@
+          Set-Content -Path build-native.bat -Value $bat -Encoding ASCII
+          cmd /c build-native.bat
+          if ($LASTEXITCODE -ne 0) { throw "native build failed" }
+          if (-not (Test-Path Trees.dll) -or -not (Test-Path waitinject.exe)) { throw "native outputs missing" }
+
+      - name: Build the web UI
+        shell: pwsh
+        working-directory: src/ui/webui
+        run: |
+          npm ci --no-audit --no-fund
+          if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { throw "web UI build failed" }
+
+      - name: Build Forest.exe
+        shell: pwsh
+        working-directory: src
+        run: |
+          dotnet publish ui/Forest.UI.csproj -c Release -o "$env:GITHUB_WORKSPACE/Forest-SelfBuilt" --nologo
+          if ($LASTEXITCODE -ne 0) { throw "dotnet publish failed" }
+          if (-not (Test-Path "$env:GITHUB_WORKSPACE/Forest-SelfBuilt/Forest.exe")) { throw "Forest.exe missing" }
+
+      - name: Record SHA-256 fingerprints
+        shell: pwsh
+        run: |
+          $out = "$env:GITHUB_WORKSPACE/Forest-SelfBuilt"
+          $files = @("$out/Forest.exe", "$out/Forest.dll", "src/trees/Trees.dll", "src/trees/waitinject.exe")
+          $lines = @("Built from commit $env:COMMIT with the auto-updater removed.", "")
+          foreach ($f in $files) { if (Test-Path $f) { $lines += ("{0}  {1}" -f (Get-FileHash $f -Algorithm SHA256).Hash, (Split-Path $f -Leaf)) } }
+          $lines | Tee-Object -FilePath "$out/BUILD-INFO.txt"
+          $lines | ForEach-Object { "    $_" } | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
+
+      - name: Upload the build
+        uses: actions/upload-artifact@v4
+        with:
+          name: Forest-SelfBuilt
+          path: Forest-SelfBuilt
+          if-no-files-found: error
