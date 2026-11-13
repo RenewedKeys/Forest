@@ -1,5 +1,6 @@
 # Builds Forest from the exact source commit that was security-reviewed
-# (d1e0178 of github.com/suspiciousman3187/Forest), with these removed:
+# (755ebae of github.com/suspiciousman3187/Forest, the v1.2.15/v1.2.16
+# source with the November 2026 PlayOnline login fix), with these removed:
 # the auto-updater, the diagnostics upload, and the developer folder override.
 # The changes are in .github/forest-hardening.patch in this repo.
 # Run it from the Actions tab -> "Build Forest (reviewed)" -> Run workflow.
@@ -15,7 +16,7 @@ permissions:
 
 env:
   UPSTREAM: https://github.com/suspiciousman3187/Forest.git
-  COMMIT: d1e017820a294c73d2b54991f12f763bb4e3c9ec
+  COMMIT: 755ebaee54dbc04ac1fa86b15cd1f875df5788b6
   DOTNET_CLI_TELEMETRY_OPTOUT: '1'
 
 jobs:
