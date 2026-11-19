@@ -1,5 +1,5 @@
 diff --git a/trees/Trees.cpp b/trees/Trees.cpp
-index 6dd1ec9..a7c1a03 100644
+index 6dd1ec9..ee87a8e 100644
 --- a/trees/Trees.cpp
 +++ b/trees/Trees.cpp
 @@ -142,12 +142,24 @@ static void DllSibling(char* out, DWORD n, const char* leaf)
@@ -37,7 +37,7 @@ index 6dd1ec9..a7c1a03 100644
      FILE* f = nullptr;
      if (fopen_s(&f, p, "w") != 0 || !f) return;
      SYSTEMTIME t; GetLocalTime(&t);
-@@ -3217,6 +3229,71 @@ static uint32_t FindWideStringInHeap(const wchar_t* needle)
+@@ -3217,6 +3229,57 @@ static uint32_t FindWideStringInHeap(const wchar_t* needle)
      return 0;
  }
  
@@ -62,20 +62,7 @@ index 6dd1ec9..a7c1a03 100644
 +    char ttl[96] = {0}; GetWindowTextA(h, ttl, sizeof(ttl));
 +    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
 +    bool offscreen = (r.left <= -30000 || r.top <= -30000);
-+    // EarlyStash also made POL's windows fully transparent (layered, alpha 0).
-+    LONG ex = GetWindowLongA(h, GWL_EXSTYLE);
-+    bool transparent = false;
-+    if (ex & WS_EX_LAYERED) {
-+        BYTE alpha = 255; DWORD lwa = 0;
-+        if (GetLayeredWindowAttributes(h, nullptr, &alpha, &lwa) && (lwa & LWA_ALPHA) && alpha < 255)
-+            transparent = true;
-+    }
-+    if (!offscreen && !transparent && !ctx->raiseAll) return TRUE;   // already visible; don't keep raising it
-+    if (transparent) {
-+        SetLayeredWindowAttributes(h, 0, 255, LWA_ALPHA);
-+        SetWindowLongA(h, GWL_EXSTYLE, ex & ~WS_EX_LAYERED);
-+        RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
-+    }
++    if (!offscreen && !ctx->raiseAll) return TRUE;   // already visible; don't keep raising it
 +    if (offscreen) {
 +        int pw = GetSystemMetrics(SM_CXSCREEN), ph = GetSystemMetrics(SM_CYSCREEN);
 +        int w = r.right - r.left, hgt = r.bottom - r.top;
@@ -90,8 +77,7 @@ index 6dd1ec9..a7c1a03 100644
 +    FLASHWINFO fw{ sizeof(fw), h, FLASHW_ALL | FLASHW_TIMERNOFG, 5, 0 };
 +    FlashWindowEx(&fw);
 +    ++ctx->n;
-+    Log("REVEAL: hwnd=0x%p class=[%s] title=[%s] was at %ld,%ld%s", h, cls, ttl, r.left, r.top,
-+        transparent ? " (was transparent; opacity restored)" : "");
++    Log("REVEAL: hwnd=0x%p class=[%s] title=[%s] was at %ld,%ld", h, cls, ttl, r.left, r.top);
 +    return TRUE;
 +}
 +
@@ -109,7 +95,7 @@ index 6dd1ec9..a7c1a03 100644
  static DWORD WINAPI PostConnectWatchdog(LPVOID)
  {
      Log("PostConnectWatchdog: armed (10s POL-5311 scan, 30s stuck deadline)");
-@@ -3266,13 +3343,37 @@ static DWORD WINAPI PostConnectWatchdog(LPVOID)
+@@ -3266,13 +3329,37 @@ static DWORD WINAPI PostConnectWatchdog(LPVOID)
      if (uint32_t hit = tryFindPOL5311()) { fireWrongPw(hit); return 0; }
      if (g_fastLoginDone) return 0;
  
