@@ -1,8 +1,123 @@
+diff --git a/trees/Trees.cpp b/trees/Trees.cpp
+index 6dd1ec9..f91bb77 100644
+--- a/trees/Trees.cpp
++++ b/trees/Trees.cpp
+@@ -142,12 +142,24 @@ static void DllSibling(char* out, DWORD n, const char* leaf)
+     if (slash) strcpy_s(slash + 1, n - (DWORD)(slash + 1 - out), leaf);
+ }
+ 
++// Per-pid marker files live in %LOCALAPPDATA%\Forest\state, shared with
++// Forest and waitinject and independent of the bin\<sha> folder this DLL was
++// extracted to. Falls back to the DLL's folder if LOCALAPPDATA is unavailable.
++// Ported from upstream v1.2.14.
++static void StateFile(char* out, DWORD n, const char* leaf)
++{
++    char base[MAX_PATH];
++    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
++    if (len == 0 || len >= MAX_PATH) { DllSibling(out, n, leaf); return; }
++    sprintf_s(out, n, "%s\\Forest\\state\\%s", base, leaf);
++}
++
+ static void PidPaths(char* out, char* fallback, DWORD n,
+                      const char* prefix, const char* ext)
+ {
+     char leaf[64];
+     sprintf_s(leaf, "%s_%lu.%s", prefix, GetCurrentProcessId(), ext);
+-    DllSibling(out, n, leaf);
++    StateFile(out, n, leaf);
+     sprintf_s(leaf, "%s.%s", prefix, ext);
+     DllSibling(fallback, n, leaf);
+ }
+@@ -156,7 +168,7 @@ static void WriteStatus(const char* state, const char* msg)
+ {
+     char p[MAX_PATH]; char leaf[48];
+     sprintf_s(leaf, "status_%lu.txt", GetCurrentProcessId());
+-    DllSibling(p, MAX_PATH, leaf);
++    StateFile(p, MAX_PATH, leaf);
+     FILE* f = nullptr;
+     if (fopen_s(&f, p, "w") != 0 || !f) return;
+     SYSTEMTIME t; GetLocalTime(&t);
+diff --git a/trees/Trees.rc b/trees/Trees.rc
+index d7d465c..3e3deab 100644
+--- a/trees/Trees.rc
++++ b/trees/Trees.rc
+@@ -1,8 +1,8 @@
+ #include <winver.h>
+ 
+ VS_VERSION_INFO VERSIONINFO
+- FILEVERSION    1,2,11,0
+- PRODUCTVERSION 1,2,11,0
++ FILEVERSION    1,2,16,0
++ PRODUCTVERSION 1,2,16,0
+  FILEFLAGSMASK  0x3fL
+  FILEFLAGS      0x0L
+  FILEOS         0x40004L
+@@ -15,11 +15,11 @@ BEGIN
+         BEGIN
+             VALUE "CompanyName",      "Forest"
+             VALUE "FileDescription",  "Forest Trees - POL injected helper"
+-            VALUE "FileVersion",      "1.2.11.0"
++            VALUE "FileVersion",      "1.2.16.0"
+             VALUE "InternalName",     "Trees.dll"
+             VALUE "OriginalFilename", "Trees.dll"
+             VALUE "ProductName",      "Forest"
+-            VALUE "ProductVersion",   "1.2.11.0"
++            VALUE "ProductVersion",   "1.2.16.0"
+         END
+     END
+     BLOCK "VarFileInfo"
+diff --git a/trees/waitinject.cpp b/trees/waitinject.cpp
+index a5da528..60b55d0 100644
+--- a/trees/waitinject.cpp
++++ b/trees/waitinject.cpp
+@@ -219,6 +219,22 @@ static bool Inject(DWORD pid, const char* dllFull)
+     return ec != 0;
+ }
+ 
++// Per-pid markers go to %LOCALAPPDATA%\Forest\state (shared with Forest and
++// Trees.dll, independent of the bin\<sha> folder). Falls back to the DLL's
++// folder if LOCALAPPDATA is unavailable. Ported from upstream v1.2.14.
++static void StateDir(char* out, DWORD n, const char* fallbackDir)
++{
++    char base[MAX_PATH];
++    DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, MAX_PATH);
++    if (len == 0 || len >= MAX_PATH) { strcpy_s(out, n, fallbackDir); return; }
++    char forest[MAX_PATH];
++    sprintf_s(forest, "%s\\Forest", base);
++    CreateDirectoryA(forest, nullptr);
++    sprintf_s(out, n, "%s\\state", forest);
++    CreateDirectoryA(out, nullptr);
++    if (GetFileAttributesA(out) == INVALID_FILE_ATTRIBUTES) strcpy_s(out, n, fallbackDir);
++}
++
+ static void WritePerPid(const char* dllDir, DWORD pid,
+                         const char* slot, const char* credSrc, bool noHide,
+                         const char* totpSrc, bool autoEnter, int ingameSlot,
+@@ -325,7 +341,8 @@ int main(int argc, char** argv)
+         return 0;
+     }
+ 
+-    WritePerPid(dllDir, target, slot, credSrc, noHide, totpSrc, autoEnter, ingameSlot, settleMs);
++    char stateDir[MAX_PATH]; StateDir(stateDir, MAX_PATH, dllDir);
++    WritePerPid(stateDir, target, slot, credSrc, noHide, totpSrc, autoEnter, ingameSlot, settleMs);
+     Sleep(50);
+     bool ok = Inject(target, dll);
+     printf(ok ? "INJECT_OK\n" : "INJECT_FAIL\n");
 diff --git a/ui/Core/Config.cs b/ui/Core/Config.cs
-index ffa1087..255f97b 100644
+index ffa1087..b5b09d8 100644
 --- a/ui/Core/Config.cs
 +++ b/ui/Core/Config.cs
-@@ -58,12 +58,10 @@ public sealed class Config
+@@ -22,6 +22,9 @@ public sealed class Config
+     public bool FastSequential { get; set; } = true;
+ 
+     public int LoginTimeoutSeconds { get; set; } = 120;
++    // How long after DONE to wait for the in-game confirmation before marking
++    // the character Login Stuck (was a fixed 90s; upstream v1.2.12).
++    public int InGameConfirmTimeoutSeconds { get; set; } = 150;
+ 
+     public bool HidePolWindow { get; set; } = true;
+ 
+@@ -58,12 +61,10 @@ public sealed class Config
  
      public int MinSecondsBetweenLaunches { get; set; } = 0;
  
@@ -16,7 +131,7 @@ index ffa1087..255f97b 100644
      public bool LoginBinBackupEnabled { get; set; } = true;
  
      public int LoginBinBackupsKeep { get; set; } = 10;
-@@ -88,21 +86,6 @@ public sealed class Config
+@@ -88,21 +89,6 @@ public sealed class Config
              ? JsonSerializer.Deserialize<Config>(File.ReadAllText(Path_)) ?? new()
              : new();
  
@@ -38,7 +153,7 @@ index ffa1087..255f97b 100644
          // One-time migrations. ConfigVersion is the source of truth for what's
          // already been applied. Each migration is idempotent within its guard.
          bool migrated = false;
-@@ -141,30 +124,9 @@ public sealed class Config
+@@ -141,30 +127,9 @@ public sealed class Config
          string.Equals(kind, "Ashita", StringComparison.OrdinalIgnoreCase)
              ? "Ashita" : "Windower";
  
@@ -72,6 +187,173 @@ index ffa1087..255f97b 100644
  
      public (string exe, string argsTemplate) ResolveLauncher(string? kind, string? overrideExe = null)
      {
+diff --git a/ui/Core/CredentialStore.cs b/ui/Core/CredentialStore.cs
+index 18d9fb9..a7920e9 100644
+--- a/ui/Core/CredentialStore.cs
++++ b/ui/Core/CredentialStore.cs
+@@ -15,11 +15,14 @@ public sealed class CredentialStore
+         string? LaunchArgs = null,
+         string? Launcher = null,
+         int IngameSlot = 0,
+-        string? LauncherExe = null);
++        string? LauncherExe = null,
++        // Ashita boot config (.ini), kept separate from the Windower profile so
++        // switching launchers doesn't overwrite one with the other (upstream v1.2.13).
++        string? AshitaBootIni = null);
+ 
+     public sealed record Account(
+         string Name, string? WindowerProfile, int PolSlot, string? LaunchArgs,
+-        string? Launcher, int IngameSlot, string? LauncherExe);
++        string? Launcher, int IngameSlot, string? LauncherExe, string? AshitaBootIni);
+ 
+     private static readonly string StorePath =
+         Path.Combine(AppData.Dir, "creds.dat");
+@@ -36,7 +39,15 @@ public sealed class CredentialStore
+         var json = File.ReadAllText(StorePath);
+         var map = JsonSerializer.Deserialize<Dictionary<string, Entry>>(json)
+                   ?? new();
+-        return new CredentialStore(new(map, StringComparer.OrdinalIgnoreCase));
++        var entries = new Dictionary<string, Entry>(map.Count, StringComparer.OrdinalIgnoreCase);
++        foreach (var (name, entry) in map)
++        {
++            // Older stores kept the Ashita .ini in WindowerProfile; seed the new field from it.
++            entries[name] = entry.AshitaBootIni == null && !string.IsNullOrWhiteSpace(entry.WindowerProfile)
++                ? entry with { AshitaBootIni = entry.WindowerProfile }
++                : entry;
++        }
++        return new CredentialStore(entries);
+     }
+ 
+     public IReadOnlyCollection<string> Profiles => _entries.Keys;
+@@ -44,7 +55,8 @@ public sealed class CredentialStore
+     public void Set(string profile, string password, string? totpSecret,
+                     string? windowerProfile = null, int polSlot = 0,
+                     string? launchArgs = null, string? launcher = null,
+-                    int ingameSlot = 0, string? launcherExe = null)
++                    int ingameSlot = 0, string? launcherExe = null,
++                    string? ashitaBootIni = null)
+     {
+ 
+         _entries.TryGetValue(profile, out var prev);
+@@ -56,13 +68,15 @@ public sealed class CredentialStore
+             launchArgs ?? prev?.LaunchArgs,
+             launcher ?? prev?.Launcher,
+             ingameSlot,
+-            launcherExe);
++            launcherExe,
++            ashitaBootIni ?? prev?.AshitaBootIni);
+         Save();
+     }
+ 
+     public void SetMeta(string profile, string? windowerProfile, int polSlot,
+                         string? launchArgs = null, string? launcher = null,
+-                        int ingameSlot = 0, string? launcherExe = null)
++                        int ingameSlot = 0, string? launcherExe = null,
++                        string? ashitaBootIni = null)
+     {
+         var e = Require(profile);
+         _entries[profile] = e with
+@@ -73,6 +87,7 @@ public sealed class CredentialStore
+             Launcher = launcher ?? e.Launcher,
+             IngameSlot = ingameSlot,
+             LauncherExe = launcherExe,
++            AshitaBootIni = ashitaBootIni ?? e.AshitaBootIni,
+         };
+         Save();
+     }
+@@ -91,13 +106,13 @@ public sealed class CredentialStore
+         _entries.Select(kv => new Account(
+             kv.Key, kv.Value.WindowerProfile, kv.Value.PolSlot,
+             kv.Value.LaunchArgs, kv.Value.Launcher, kv.Value.IngameSlot,
+-            kv.Value.LauncherExe)).ToList();
++            kv.Value.LauncherExe, kv.Value.AshitaBootIni)).ToList();
+ 
+     public Account GetAccount(string profile)
+     {
+         var e = Require(profile);
+         return new Account(profile, e.WindowerProfile, e.PolSlot, e.LaunchArgs,
+-                           e.Launcher, e.IngameSlot, e.LauncherExe);
++                           e.Launcher, e.IngameSlot, e.LauncherExe, e.AshitaBootIni);
+     }
+ 
+     public bool Remove(string profile)
+diff --git a/ui/Core/DesktopShortcut.cs b/ui/Core/DesktopShortcut.cs
+new file mode 100644
+index 0000000..b134c55
+--- /dev/null
++++ b/ui/Core/DesktopShortcut.cs
+@@ -0,0 +1,71 @@
++using System.Diagnostics;
++using System.IO;
++using System.Reflection;
++using System.Text;
++
++namespace Forest;
++
++// "Create Desktop Shortcut" in the Edit Account dialog (ported from upstream
++// v1.2.12). Makes "Forest - <account>.lnk" on the desktop that starts Forest
++// with --launch "<account>" --quit-when-loaded, marked Run as administrator.
++public static class DesktopShortcut
++{
++    public sealed record Result(bool Ok, string? Path, string? Error);
++
++    public static Result CreateForProfile(string profile)
++    {
++        try
++        {
++            var exe = Process.GetCurrentProcess().MainModule?.FileName
++                      ?? Assembly.GetExecutingAssembly().Location;
++            if (string.IsNullOrEmpty(exe) || !File.Exists(exe))
++                return new Result(false, null, "Forest.exe path could not be resolved");
++
++            var desktop = Environment.GetFolderPath(Environment.SpecialFolder.Desktop);
++            var lnk = System.IO.Path.Combine(desktop, $"Forest - {MakeSafeFileName(profile)}.lnk");
++
++            var shellType = Type.GetTypeFromProgID("WScript.Shell");
++            if (shellType == null)
++                return new Result(false, null, "WScript.Shell not available on this system");
++
++            dynamic shell = Activator.CreateInstance(shellType)!;
++            dynamic sc = shell.CreateShortcut(lnk);
++            sc.TargetPath = exe;
++            sc.Arguments = $"--launch \"{profile}\" --quit-when-loaded";
++            sc.WorkingDirectory = System.IO.Path.GetDirectoryName(exe) ?? "";
++            sc.IconLocation = exe + ",0";
++            sc.Description = $"Launch {profile} via Forest";
++            sc.Save();
++
++            // Set the shell link's "Run as administrator" flag (LinkFlags
++            // RunAsUser, bit 0x20 of byte 0x15), since Forest needs admin.
++            try
++            {
++                var bytes = File.ReadAllBytes(lnk);
++                if (bytes.Length > 21)
++                {
++                    bytes[21] |= 0x20;
++                    File.WriteAllBytes(lnk, bytes);
++                }
++            }
++            catch (Exception ex)
++            {
++                return new Result(true, lnk, "shortcut created but Run-as-Admin flag failed: " + ex.Message);
++            }
++            return new Result(true, lnk, null);
++        }
++        catch (Exception ex)
++        {
++            return new Result(false, null, ex.Message);
++        }
++    }
++
++    private static string MakeSafeFileName(string s)
++    {
++        var invalid = System.IO.Path.GetInvalidFileNameChars();
++        var sb = new StringBuilder(s.Length);
++        foreach (var c in s) sb.Append(Array.IndexOf(invalid, c) >= 0 ? '_' : c);
++        var r = sb.ToString().Trim();
++        return string.IsNullOrEmpty(r) ? "Account" : r;
++    }
++}
 diff --git a/ui/Core/DesktopUpdater.cs b/ui/Core/DesktopUpdater.cs
 deleted file mode 100644
 index e1157a5..0000000
@@ -168,10 +450,18 @@ index e1157a5..0000000
 -    private static string Quote(string p) => "\"" + p + "\"";
 -}
 diff --git a/ui/Core/DiagLog.cs b/ui/Core/DiagLog.cs
-index 1dd5da5..4698210 100644
+index 1dd5da5..0cf9e1d 100644
 --- a/ui/Core/DiagLog.cs
 +++ b/ui/Core/DiagLog.cs
-@@ -53,22 +53,10 @@ internal static class DiagLog
+@@ -37,6 +37,7 @@ internal static class DiagLog
+             Directory.CreateDirectory(Dir);
+             WriteReadme();
+             Prune();
++            try { NativeAssets.MigrateLegacyMarkers(); } catch { }
+             File.AppendAllText(SessionFile,
+                 $"[{DateTime.Now:HH:mm:ss.fff}] === Forest session start (v{AppVersion}, elevated={(IsElevated() ? "YES" : "no")}) ===\r\n");
+         }
+@@ -53,22 +54,10 @@ internal static class DiagLog
          "names in plaintext. Sharing them directly leaks PII you probably do not\r\n" +
          "want public.\r\n" +
          "\r\n" +
@@ -312,6 +602,246 @@ index 8cb2ef9..0000000
 -    private static string Truncate(string s, int n) =>
 -        string.IsNullOrEmpty(s) ? "" : (s.Length <= n ? s : s.Substring(0, n) + "...");
 -}
+diff --git a/ui/Core/LaunchService.cs b/ui/Core/LaunchService.cs
+index 15d3e8b..a1750b0 100644
+--- a/ui/Core/LaunchService.cs
++++ b/ui/Core/LaunchService.cs
+@@ -11,7 +11,7 @@ public sealed class LaunchService
+ 
+     private readonly Config _cfg;
+     private readonly CredentialStore _store;
+-    private readonly string _treesDir, _treesDll, _waitInject;
++    private readonly string _treesDir, _treesDll, _waitInject, _stateDir;
+ 
+     public LaunchService(Config cfg, CredentialStore store)
+     {
+@@ -20,6 +20,7 @@ public sealed class LaunchService
+         _treesDir   = cfg.ResolveTreesDir();
+         _treesDll   = Path.Combine(_treesDir, "Trees.dll");
+         _waitInject = Path.Combine(_treesDir, "waitinject.exe");
++        _stateDir   = NativeAssets.SharedStateDir();
+     }
+ 
+     public sealed record Handle(string Profile, int Pid, string StatusFile, bool InjectOk = true);
+@@ -62,9 +63,13 @@ public sealed class LaunchService
+         catch {  }
+ 
+         var acct = _store.GetAccount(profile);
+-        if (string.IsNullOrWhiteSpace(acct.WindowerProfile))
++        var kind = Config.NormalizeLauncher(acct.Launcher ?? _cfg.DefaultLauncher);
++        bool isAshita = string.Equals(kind, "Ashita", StringComparison.OrdinalIgnoreCase);
++        var effectiveProfile = isAshita ? acct.AshitaBootIni : acct.WindowerProfile;
++        if (string.IsNullOrWhiteSpace(effectiveProfile))
+             throw new InvalidOperationException(
+-                $"'{profile}' has no Windower profile. Edit it in the account dialog.");
++                $"'{profile}' has no {(isAshita ? "Ashita boot config (.ini)" : "Windower profile")}. " +
++                "Edit it in the account dialog.");
+ 
+         bool noAuto = _cfg.DisableAutoLogin && !_cfg.HidePolWindow;
+ 
+@@ -72,14 +77,13 @@ public sealed class LaunchService
+             throw new InvalidOperationException(
+                 $"'{profile}' has no POL slot. Edit it in the account dialog.");
+ 
+-        var kind = Config.NormalizeLauncher(acct.Launcher ?? _cfg.DefaultLauncher);
+         var (launcherExe, launcherArgs) = _cfg.ResolveLauncher(kind, acct.LauncherExe);
+ 
+         var marker = (_cfg.ParallelLaunch && kind != "Ashita")
+             ? "F" + Guid.NewGuid().ToString("N") : null;
+ 
+-        var credSrc = Path.Combine(_treesDir, $"cred_src_{profile}.bin");
+-        var totpSrc = Path.Combine(_treesDir, $"totp_src_{profile}.bin");
++        var credSrc = Path.Combine(_stateDir, $"cred_src_{profile}.bin");
++        var totpSrc = Path.Combine(_stateDir, $"totp_src_{profile}.bin");
+         bool haveTotp = false;
+         if (!noAuto)
+         {
+@@ -134,7 +138,7 @@ public sealed class LaunchService
+                         log($"[waitinject] {line}");
+                         if (line.StartsWith("READY"))
+                             LaunchGame(launcherExe, launcherArgs, kind,
+-                                       acct.WindowerProfile!, acct.LaunchArgs,
++                                       effectiveProfile!, acct.LaunchArgs,
+                                        marker, log);
+                         else if (line.StartsWith("CAPTURED_PID="))
+                         {
+@@ -208,7 +212,7 @@ public sealed class LaunchService
+             }
+ 
+             return new Handle(profile, pid,
+-                Path.Combine(_treesDir, $"status_{pid}.txt"),
++                Path.Combine(_stateDir, $"status_{pid}.txt"),
+                 InjectOk: injectOk);
+         }
+         finally
+@@ -254,7 +258,7 @@ public sealed class LaunchService
+             log($"bgres sidecar: no DWORD values found under FinalFantasyXI key");
+             return;
+         }
+-        var path = Path.Combine(_treesDir, $"bgres_{pid}.txt");
++        var path = Path.Combine(_stateDir, $"bgres_{pid}.txt");
+         File.WriteAllLines(path, lines);
+         log($"bgres sidecar written: {path} ({lines.Count} keys)");
+     }
+diff --git a/ui/Core/LoginBinBackup.cs b/ui/Core/LoginBinBackup.cs
+index 2cdc52b..76c1904 100644
+--- a/ui/Core/LoginBinBackup.cs
++++ b/ui/Core/LoginBinBackup.cs
+@@ -1,4 +1,6 @@
++using System.Diagnostics;
+ using System.IO;
++using System.Threading;
+ using System.Security.Cryptography;
+ using System.Text;
+ using Microsoft.Win32;
+@@ -112,6 +114,86 @@ public static class LoginBinBackup
+ 
+     public static string GetBackupDir() => BackupDir;
+ 
++    // ── login_w.bin lock gate + auto-restore (ported from upstream v1.2.13) ──
++
++    // True when some pol.exe still has a login_w.bin open.
++    public static bool IsAnyLoginBinLocked(Config cfg)
++    {
++        foreach (var c in DiscoverPaths(cfg))
++        {
++            if (!File.Exists(c.Path)) continue;
++            try { using (new FileStream(c.Path, FileMode.Open, FileAccess.Read, FileShare.None)) { } }
++            catch (IOException) { return true; }
++            catch (UnauthorizedAccessException) { return true; }
++            catch { }
++        }
++        return false;
++    }
++
++    // Waits (up to maxSeconds) until no pol.exe holds login_w.bin open, so the
++    // next launch can't race the previous one writing it. Returns ms waited.
++    public static int WaitForLoginBinFree(Config cfg, Action<string> log, int maxSeconds)
++    {
++        if (maxSeconds <= 0) return 0;
++        var start = DateTime.UtcNow;
++        var deadline = start.AddSeconds(maxSeconds);
++        bool announced = false;
++        while (DateTime.UtcNow < deadline)
++        {
++            if (!IsAnyLoginBinLocked(cfg))
++            {
++                int waited = (int)(DateTime.UtcNow - start).TotalMilliseconds;
++                if (announced) log($"POL-LOGINBIN: gate cleared after {waited}ms");
++                return waited;
++            }
++            if (!announced)
++            {
++                log("POL-LOGINBIN: gate holding next launch, a pol.exe still has login_w.bin open");
++                announced = true;
++            }
++            Thread.Sleep(200);
++        }
++        log($"POL-LOGINBIN: gate TIMEOUT after {maxSeconds}s (file still locked). Proceeding anyway; a pol.exe may have crashed holding the file.");
++        return maxSeconds * 1000;
++    }
++
++    // If no POL is running and a login_w.bin looks corrupt (under 1 KB),
++    // restores it from the newest good backup.
++    public static void AutoRestoreIfCorrupt(Config cfg, Action<string> log)
++    {
++        if (!cfg.LoginBinBackupEnabled || !Directory.Exists(BackupDir)) return;
++
++        var running = Process.GetProcessesByName("pol");
++        bool anyRunning = running.Length != 0;
++        foreach (var pr in running) { try { pr.Dispose(); } catch { } }
++        if (anyRunning) return;
++
++        foreach (var c in DiscoverPaths(cfg))
++        {
++            if (!File.Exists(c.Path)) continue;
++            long size;
++            try { size = new FileInfo(c.Path).Length; }
++            catch { continue; }
++            if (size >= 1024) continue;
++
++            var hash = ShortHash(c.Path);
++            var best = new DirectoryInfo(BackupDir).GetFiles($"login_w__{hash}__*.bin")
++                .Where(f => !f.Name.Contains("__pre-restore", StringComparison.Ordinal))
++                .OrderByDescending(f => f.LastWriteTimeUtc)
++                .FirstOrDefault();
++            if (best == null || best.Length < 1024)
++            {
++                log($"POL-LOGINBIN: {c.Path} is {size} bytes (corrupt suspect) but no valid backup found. Leaving untouched.");
++                continue;
++            }
++            var r = Restore(cfg, best.FullName, c.Path);
++            if (r.Ok)
++                log($"POL-LOGINBIN: auto-restored {c.Path} from {best.Name} (was {size} bytes, backup {best.Length} bytes). Emergency snapshot: {r.EmergencyBackupPath}");
++            else
++                log($"POL-LOGINBIN: auto-restore FAILED for {c.Path}: {r.Error}");
++        }
++    }
++
+     public sealed record BackupEntry(string BackupPath, string TargetPath, string TargetSource, DateTime CreatedUtc, long SizeBytes, bool IsPreRestoreEmergency);
+ 
+     public static IReadOnlyList<BackupEntry> ListBackups(Config cfg)
+diff --git a/ui/Core/NativeAssets.cs b/ui/Core/NativeAssets.cs
+index e8bbb75..4b9f96d 100644
+--- a/ui/Core/NativeAssets.cs
++++ b/ui/Core/NativeAssets.cs
+@@ -38,6 +38,56 @@ public static class NativeAssets
+         }
+     }
+ 
++    // Per-character marker files (status_/slot_/cred_/totp_/nohide_/autoenter_/
++    // bgres_) live here instead of next to Trees.dll, so rebuilding Forest (which
++    // changes the bin\<sha> folder) no longer orphans characters that are still
++    // running. Ported from upstream v1.2.14.
++    private static readonly string[] MarkerPrefixes =
++        { "status_", "slot_", "nohide_", "autoenter_", "bgres_", "cred_", "totp_", "cred_src_", "totp_src_" };
++
++    public static string SharedStateDir()
++    {
++        var dir = Path.Combine(
++            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
++            "Forest", "state");
++        try { Directory.CreateDirectory(dir); } catch { }
++        return dir;
++    }
++
++    // One-time move of markers left in old bin\<sha> folders into the state folder.
++    public static void MigrateLegacyMarkers()
++    {
++        try
++        {
++            var bin = Path.Combine(
++                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
++                "Forest", "bin");
++            if (!Directory.Exists(bin)) return;
++            var state = SharedStateDir();
++            int moved = 0, skipped = 0;
++            foreach (var sub in Directory.GetDirectories(bin))
++                foreach (var file in Directory.GetFiles(sub))
++                {
++                    var name = Path.GetFileName(file);
++                    if (!Array.Exists(MarkerPrefixes, p => name.StartsWith(p, StringComparison.OrdinalIgnoreCase)))
++                        continue;
++                    var dst = Path.Combine(state, name);
++                    try
++                    {
++                        if (File.Exists(dst)) { skipped++; try { File.Delete(file); } catch { } }
++                        else { File.Move(file, dst); moved++; }
++                    }
++                    catch { skipped++; }
++                }
++            if (moved > 0 || skipped > 0)
++                DiagLog.Log($"NativeAssets: legacy-marker migration -> {state} moved={moved} skipped={skipped}");
++        }
++        catch (Exception ex)
++        {
++            try { DiagLog.Log("NativeAssets: legacy-marker migration failed: " + ex.Message); } catch { }
++        }
++    }
++
+     public static string TreesDllPath()    => Path.Combine(RuntimeDir(), "Trees.dll");
+     public static string WaitInjectPath()  => Path.Combine(RuntimeDir(), "waitinject.exe");
+ 
 diff --git a/ui/Core/UpdateManager.cs b/ui/Core/UpdateManager.cs
 index e2bc580..ec5a344 100644
 --- a/ui/Core/UpdateManager.cs
@@ -494,11 +1024,50 @@ index e2bc580..ec5a344 100644
      public static string Sha256Hex(string path)
      {
          using var sha = SHA256.Create();
+diff --git a/ui/Forest.UI.csproj b/ui/Forest.UI.csproj
+index e10edfb..8d51d3d 100644
+--- a/ui/Forest.UI.csproj
++++ b/ui/Forest.UI.csproj
+@@ -10,7 +10,7 @@
+     <AssemblyName>Forest</AssemblyName>
+     <Product>Forest</Product>
+     <AssemblyTitle>Forest</AssemblyTitle>
+-    <Version>1.2.11</Version>
++    <Version>1.2.16</Version>
+     <StartupObject>Forest.UI.Program</StartupObject>
+     <ApplicationManifest>app.manifest</ApplicationManifest>
+     <ApplicationIcon>Assets\app.ico</ApplicationIcon>
 diff --git a/ui/WebBridge.cs b/ui/WebBridge.cs
-index 0171227..a0acb2f 100644
+index 0171227..8df97a4 100644
 --- a/ui/WebBridge.cs
 +++ b/ui/WebBridge.cs
-@@ -258,18 +258,7 @@ public sealed class WebBridge
+@@ -77,7 +77,6 @@ public sealed class WebBridge
+     private const double TerminatedBadgeSeconds = 8;
+     private const double WrongPwBadgeSeconds = 60;
+     private const double LoginStuckBadgeSeconds = 60;
+-    private const double InGameTimeoutSeconds = 90;
+ 
+     public WebBridge(CoreWebView2 core, Window window)
+     {
+@@ -163,6 +162,17 @@ public sealed class WebBridge
+             case "config.set": ApplyConfigPatch(p); Reply(id, true, null, null); break;
+ 
+             case "accounts.list": Reply(id, true, ListAccounts(), null); break;
++            case "shortcut.createDesktop":
++            {
++                var sp = p.TryGetProperty("profile", out var spv) && spv.ValueKind == JsonValueKind.String ? spv.GetString() ?? "" : "";
++                if (string.IsNullOrWhiteSpace(sp)) { Reply(id, false, null, "profile required"); break; }
++                var r = DesktopShortcut.CreateForProfile(sp);
++                Reply(id, true, new { ok = r.Ok, path = r.Path, error = r.Error }, null);
++                break;
++            }
++            case "accounts.resetStatus":
++                ResetStatus(p.TryGetProperty("profile", out var rsp) && rsp.ValueKind == JsonValueKind.String ? rsp.GetString() ?? "" : "");
++                Reply(id, true, null, null); break;
+             case "accounts.save": SaveAccount(p); Reply(id, true, null, null); EmitStatus(); break;
+             case "accounts.remove":
+                 CredentialStore.Load().Remove(p.GetProperty("profile").GetString() ?? "");
+@@ -258,18 +268,7 @@ public sealed class WebBridge
                  });
                  break;
              case "diagnostics.upload":
@@ -518,7 +1087,15 @@ index 0171227..a0acb2f 100644
              case "update.snapshot": Reply(id, true, UpdateSnapshotDto(), null); break;
              case "update.check":
                  Task.Run(async () => { try { await UpdateManager.Instance.CheckAsync(respectSkip: false); } catch { } });
-@@ -343,7 +332,6 @@ public sealed class WebBridge
+@@ -325,6 +324,7 @@ public sealed class WebBridge
+         staggerSeconds = c.StaggerSeconds,
+         fastSequential = c.FastSequential,
+         loginTimeoutSeconds = c.LoginTimeoutSeconds,
++        inGameConfirmTimeoutSeconds = c.InGameConfirmTimeoutSeconds,
+         hidePolWindow = c.HidePolWindow,
+         disableAutoLogin = c.DisableAutoLogin,
+         usePolProxy = c.UsePolProxy,
+@@ -343,7 +343,6 @@ public sealed class WebBridge
          minSecondsBetweenLaunches = c.MinSecondsBetweenLaunches,
          checkUpdatesOnStartup = c.CheckUpdatesOnStartup,
          skippedUpdateVersion = c.SkippedUpdateVersion ?? "",
@@ -526,7 +1103,7 @@ index 0171227..a0acb2f 100644
          currentVersion = UpdateManager.GetCurrentVersion(),
          clockSkewSeconds = Diagnostics.LastClockSkewSeconds,
          loginBinBackupEnabled = c.LoginBinBackupEnabled,
-@@ -367,7 +355,6 @@ public sealed class WebBridge
+@@ -367,13 +366,13 @@ public sealed class WebBridge
              {
                  case "windowerExe": c.WindowerExe = E(prop.Value.GetString()); break;
                  case "ashitaExe": c.AshitaExe = E(prop.Value.GetString()); break;
@@ -534,7 +1111,14 @@ index 0171227..a0acb2f 100644
                  case "defaultLauncher": c.DefaultLauncher = Config.NormalizeLauncher(prop.Value.GetString()); break;
                  case "windowerArgs": c.WindowerArgs = prop.Value.GetString() ?? c.WindowerArgs; break;
                  case "ashitaArgs": c.AshitaArgs = prop.Value.GetString() ?? c.AshitaArgs; break;
-@@ -396,7 +383,6 @@ public sealed class WebBridge
+                 case "staggerSeconds": c.StaggerSeconds = prop.Value.GetInt32(); break;
+                 case "fastSequential": c.FastSequential = prop.Value.GetBoolean(); break;
+                 case "loginTimeoutSeconds": c.LoginTimeoutSeconds = prop.Value.GetInt32(); break;
++                case "inGameConfirmTimeoutSeconds": c.InGameConfirmTimeoutSeconds = Math.Clamp(prop.Value.GetInt32(), 30, 600); break;
+                 case "hidePolWindow": c.HidePolWindow = prop.Value.GetBoolean(); break;
+                 case "disableAutoLogin": c.DisableAutoLogin = prop.Value.GetBoolean(); break;
+                 case "usePolProxy": c.UsePolProxy = prop.Value.GetBoolean(); break;
+@@ -396,7 +395,6 @@ public sealed class WebBridge
                  case "autoTerminateMinutes": c.AutoTerminateMinutes = Math.Max(1, prop.Value.GetInt32()); break;
                  case "minSecondsBetweenLaunches": c.MinSecondsBetweenLaunches = Math.Max(0, Math.Min(120, prop.Value.GetInt32())); break;
                  case "checkUpdatesOnStartup": c.CheckUpdatesOnStartup = prop.Value.GetBoolean(); break;
@@ -542,19 +1126,161 @@ index 0171227..a0acb2f 100644
                  case "loginBinBackupEnabled": c.LoginBinBackupEnabled = prop.Value.GetBoolean(); break;
                  case "loginBinBackupsKeep": c.LoginBinBackupsKeep = Math.Max(1, Math.Min(50, prop.Value.GetInt32())); break;
                  case "loginBinPathOverrides":
+@@ -430,6 +428,7 @@ public sealed class WebBridge
+             {
+                 profile = t.a.Name,
+                 windower = t.a.WindowerProfile ?? "",
++                ashitaBootIni = t.a.AshitaBootIni ?? "",
+                 polSlot = t.a.PolSlot,
+                 ingameSlot = t.a.IngameSlot,
+                 launcher = string.Equals(t.a.Launcher, "Ashita", StringComparison.OrdinalIgnoreCase) ? "Ashita"
+@@ -450,6 +449,7 @@ public sealed class WebBridge
+         var profile = Get("profile").Trim();
+         var original = p.TryGetProperty("originalProfile", out var ov) && ov.ValueKind == JsonValueKind.String ? ov.GetString() : null;
+         var windower = string.IsNullOrWhiteSpace(Get("windower")) ? null : Get("windower").Trim();
++        var ashitaBootIni = string.IsNullOrWhiteSpace(Get("ashitaBootIni")) ? null : Get("ashitaBootIni").Trim();
+         var args = string.IsNullOrWhiteSpace(Get("launchArgs")) ? null : Get("launchArgs").Trim();
+         var launcherExe = string.IsNullOrWhiteSpace(Get("launcherExe")) ? null : Get("launcherExe").Trim();
+         var pw = Get("password");
+@@ -479,12 +479,12 @@ public sealed class WebBridge
+         if (!editing)
+         {
+             if (string.IsNullOrEmpty(pw)) throw new InvalidOperationException("SE password is required for a new account.");
+-            store.Set(profile, pw, totp, windower, slot, args, launcher, ingame, launcherExe);
++            store.Set(profile, pw, totp, windower, slot, args, launcher, ingame, launcherExe, ashitaBootIni);
+         }
+         else if (!string.IsNullOrEmpty(pw))
+-            store.Set(profile, pw, totp, windower, slot, args, launcher, ingame, launcherExe);
++            store.Set(profile, pw, totp, windower, slot, args, launcher, ingame, launcherExe, ashitaBootIni);
+         else
+-            store.SetMeta(profile, windower, slot, args, launcher, ingame, launcherExe);
++            store.SetMeta(profile, windower, slot, args, launcher, ingame, launcherExe, ashitaBootIni);
+ 
+         if (editing && totp != null) store.SetTotp(profile, totp);
+ 
+@@ -752,10 +752,10 @@ public sealed class WebBridge
+             {
+                 if (!_doneSince.ContainsKey(h.Pid))
+                     _doneSince[h.Pid] = DateTime.UtcNow;
+-                else if ((DateTime.UtcNow - _doneSince[h.Pid]).TotalSeconds > InGameTimeoutSeconds)
++                else if ((DateTime.UtcNow - _doneSince[h.Pid]).TotalSeconds > Math.Max(30, cfg.InGameConfirmTimeoutSeconds))
+                 {
+                     _doneSince.Remove(h.Pid);
+-                    DiagLog.Log($"[{profile}] DONE→IN_GAME timeout after {InGameTimeoutSeconds}s; " +
++                    DiagLog.Log($"[{profile}] DONE→IN_GAME timeout after {Math.Max(30, cfg.InGameConfirmTimeoutSeconds)}s; " +
+                                 "Trees.dll never confirmed in-game (sig-scan may have missed party global). " +
+                                 "NOT terminating pol.exe — leaving it running. Marking as LOGIN STUCK for visibility. " +
+                                 "If FFXiMain.dll subsequently loads in the pol.exe process, we'll auto-promote to RUNNING.");
+@@ -1069,9 +1069,38 @@ public sealed class WebBridge
+         return true;
+     }
+ 
++    // Drops leftover bookkeeping for a profile whose pol.exe is gone, so a
++    // character stuck in a stale state can be launched again (upstream v1.2.13).
++    private void ClearStaleState(string profile)
++    {
++        if (_handles.TryGetValue(profile, out var h) && !PolAlive(h.Pid))
++        {
++            _handles.TryRemove(profile, out _);
++            _noAuto.TryRemove(profile, out _);
++            _reattached.Remove(profile);
++        }
++        _cancelled.TryRemove(profile, out _);
++        LaunchService.InFlightWaitinjects.TryRemove(profile, out _);
++    }
++
++    // Per-row Refresh button: clears a stuck status (upstream v1.2.13).
++    public void ResetStatus(string profile)
++    {
++        if (string.IsNullOrWhiteSpace(profile)) return;
++        ClearStaleState(profile);
++        if (!_handles.ContainsKey(profile))
++        {
++            Set(profile, "INACTIVE", 0);
++            StatOf(profile).TermAt = null;
++        }
++        DiagLog.Log($"reset-status [{profile}]");
++        EmitStatus();
++    }
++
+     private void Launch(string[] profiles)
+     {
+         if (_launching) return;
++        foreach (var p in profiles) ClearStaleState(p);
+         var launch = profiles.Where(IsLaunchable).ToList();
+         if (launch.Count == 0) return;
+ 
+@@ -1084,6 +1113,8 @@ public sealed class WebBridge
+         {
+             try { LoginBinBackup.RunBackup(cfgForBackup); }
+             catch (Exception ex) { DiagLog.Log("Launch: login_w.bin pre-backup failed: " + ex.Message); }
++            try { LoginBinBackup.AutoRestoreIfCorrupt(cfgForBackup, DiagLog.Log); }
++            catch (Exception ex) { DiagLog.Log("Launch: login_w.bin auto-restore failed: " + ex.Message); }
+         });
+ 
+         _launching = true;
+@@ -1184,6 +1215,7 @@ public sealed class WebBridge
+                     {
+                         // No login to gate on; just stagger so we don't open every POL at once.
+                         Thread.Sleep(TimeSpan.FromSeconds(Math.Max(1, cfg.StaggerSeconds)));
++                        LoginBinBackup.WaitForLoginBinFree(cfg, DiagLog.Log, 20);
+                         continue;
+                     }
+                     var deadline = DateTime.UtcNow.AddSeconds(cfg.LoginTimeoutSeconds + 30);
+@@ -1195,6 +1227,10 @@ public sealed class WebBridge
+                         Thread.Sleep(500);
+                     }
+ 
++                    // Don't start the next POL while the previous one still has
++                    // login_w.bin open (upstream v1.2.13).
++                    LoginBinBackup.WaitForLoginBinFree(cfg, DiagLog.Log, 20);
++
+                     // FFXi bg-res clobber barrier (opt-in, Windower-only). The
+                     // next Windower launch will write its profile's bg-res
+                     // values directly into HKLM\...\FinalFantasyXI\0001-0004;
+@@ -1328,7 +1364,7 @@ public sealed class WebBridge
+     private void ReattachRunning()
+     {
+         string dir;
+-        try { dir = Config.Load().ResolveTreesDir(); }
++        try { dir = NativeAssets.SharedStateDir(); }
+         catch { return; }
+         if (!Directory.Exists(dir)) return;
+ 
+@@ -1365,7 +1401,7 @@ public sealed class WebBridge
+     private object[] ScanStale()
+     {
+         string dir;
+-        try { dir = Config.Load().ResolveTreesDir(); }
++        try { dir = NativeAssets.SharedStateDir(); }
+         catch { return Array.Empty<object>(); }
+         if (!Directory.Exists(dir)) return Array.Empty<object>();
+ 
+@@ -1390,7 +1426,7 @@ public sealed class WebBridge
+     private void KillStale(int[] pids)
+     {
+         string dir;
+-        try { dir = Config.Load().ResolveTreesDir(); }
++        try { dir = NativeAssets.SharedStateDir(); }
+         catch { return; }
+         if (!Directory.Exists(dir)) return;
+         foreach (var pid in pids)
 diff --git a/ui/webui/src/App.tsx b/ui/webui/src/App.tsx
-index f968cdb..eb6c3d0 100644
+index f968cdb..5ba9151 100644
 --- a/ui/webui/src/App.tsx
 +++ b/ui/webui/src/App.tsx
-@@ -8,7 +8,7 @@ import { api, subscribe } from './bridge';
+@@ -8,9 +8,9 @@ import { api, subscribe } from './bridge';
  import { syncScrollbarFromVar } from './scrollbar';
  import { useTheme } from './theme';
  import { DEMO, demoSelection } from './demo';
 -import type { Account, AccountStatus, Config, UpdateSnapshot } from './types';
 +import type { Account, AccountStatus, Config } from './types';
  
- const VERSION = '1.2.11';
+-const VERSION = '1.2.11';
++const VERSION = '1.2.16';
  type Tab = 'home' | 'settings';
+ 
+ export default function App() {
 @@ -119,8 +119,6 @@ function FullApp() {
          </div>
        </div>
@@ -620,8 +1346,203 @@ index f968cdb..eb6c3d0 100644
  
  function TabButton({ id, tab, setTab, children }: { id: Tab; tab: Tab; setTab: (t: Tab) => void; children: ReactNode }) {
    const active = id === tab;
+diff --git a/ui/webui/src/bridge.ts b/ui/webui/src/bridge.ts
+index 2b0e72c..4013df9 100644
+--- a/ui/webui/src/bridge.ts
++++ b/ui/webui/src/bridge.ts
+@@ -58,6 +58,8 @@ export const api = {
+   getConfig:        () => call<Config>('config.get'),
+   setConfig:        (patch: Partial<Config>) => call<void>('config.set', patch),
+   listAccounts:     () => call<Account[]>('accounts.list'),
++  resetStatus:      (profile: string) => call<void>('accounts.resetStatus', { profile }),
++  createDesktopShortcut: (profile: string) => call<{ ok: boolean; path?: string; error?: string }>('shortcut.createDesktop', { profile }),
+   saveAccount:      (a: AccountSave) => call<void>('accounts.save', a),
+   removeAccount:    (profile: string) => call<void>('accounts.remove', { profile }),
+   reorder:          (order: string[]) => call<void>('accounts.reorder', { order }),
+@@ -103,6 +105,7 @@ const mockConfig: Config = {
+   staggerSeconds: 8,
+   fastSequential: true,
+   loginTimeoutSeconds: 120,
++  inGameConfirmTimeoutSeconds: 150,
+   hidePolWindow: true,
+   disableAutoLogin: false,
+   usePolProxy: true,
+@@ -122,7 +125,7 @@ const mockConfig: Config = {
+   checkUpdatesOnStartup: true,
+   skippedUpdateVersion: '',
+   diagnosticsUploadUrl: '',
+-  currentVersion: '1.2.11',
++  currentVersion: '1.2.16',
+   clockSkewSeconds: null,
+   loginBinBackupEnabled: true,
+   loginBinBackupsKeep: 10,
+@@ -185,7 +188,7 @@ function mockCall<T>(method: string, params?: unknown): Promise<T> {
+     case 'diagnostics.upload': return delay({ ok: true, id: 'mock-' + Math.floor(Math.random() * 9999), url: null, error: null });
+     case 'update.snapshot': return delay({
+       desktop: { kind: 'idle' as const },
+-      currentVersion: '1.2.11',
++      currentVersion: '1.2.16',
+       checkOnStartup: true,
+       lastCheckIso: null,
+     });
+diff --git a/ui/webui/src/components/AccountModal.tsx b/ui/webui/src/components/AccountModal.tsx
+index 0c19c4c..7c424b6 100644
+--- a/ui/webui/src/components/AccountModal.tsx
++++ b/ui/webui/src/components/AccountModal.tsx
+@@ -29,6 +29,8 @@ export function AccountModal({ account, accounts, config, onClose, onSaved }:
+   const [totp, setTotp] = useState('');
+   const [launcher, setLauncher] = useState<Launcher>(account?.launcher ?? 'Default');
+   const [windower, setWindower] = useState(account?.windower ?? '');
++  const [ashitaBootIni, setAshitaBootIni] = useState(account?.ashitaBootIni ?? '');
++  const [notice, setNotice] = useState('');
+   const [polSlot, setPolSlot] = useState(account?.polSlot ? String(account.polSlot) : '1');
+   const [ingameSlot, setIngameSlot] = useState(account?.ingameSlot ? String(account.ingameSlot) : '1');
+   const [args, setArgs] = useState(account?.launchArgs ?? '');
+@@ -66,7 +68,8 @@ export function AccountModal({ account, accounts, config, onClose, onSaved }:
+       await api.saveAccount({
+         profile: name.trim(),
+         originalProfile: account?.profile,
+-        windower: windower.trim() || (effective === 'Ashita' ? 'default.ini' : 'Default Profile'),
++        windower: windower.trim() || 'Default Profile',
++        ashitaBootIni: ashitaBootIni.trim() || 'default.ini',
+         polSlot: Number(polSlot) || 1,
+         ingameSlot: Number(ingameSlot) || 1,
+         launcher,
+@@ -93,10 +96,24 @@ export function AccountModal({ account, accounts, config, onClose, onSaved }:
+       title={editing ? `Edit Account — ${account!.profile}` : 'Add Account'}
+       onClose={onClose}
+       footer={<>
++        {editing && (
++          <Button onClick={async () => {
++            setErr(''); setNotice('');
++            try {
++              const r = await api.createDesktopShortcut(account!.profile);
++              if (r?.ok) setNotice(`Desktop shortcut created: ${r.path}`);
++              else setErr(`Shortcut failed: ${r?.error ?? 'unknown error'}`);
++            } catch (e) { setErr(`Shortcut failed: ${(e as Error)?.message ?? e}`); }
++          }}>Create Desktop Shortcut</Button>
++        )}
++        <span className="flex-1" />
+         <Button onClick={onClose}>Cancel</Button>
+         <Button variant="accent" onClick={busy ? undefined : save}>{busy ? 'Saving…' : 'Save'}</Button>
+       </>}
+     >
++      {notice && !err && (
++        <div className="mb-3 text-[11px] rounded-md px-3 py-2 text-emerald-300 bg-emerald-500/12 border border-emerald-500/40">{notice}</div>
++      )}
+       {err && (
+         <div className="mb-3 text-[11px] rounded-md px-3 py-2 text-red-300 bg-red-500/12 border border-red-500/40">{err}</div>
+       )}
+@@ -193,7 +210,9 @@ export function AccountModal({ account, accounts, config, onClose, onSaved }:
+           </div>
+         </RowStacked>
+         <RowStacked label={profileLabel} desc={effective === 'Ashita' ? 'Ashita boot config (.ini). Blank uses default.ini.' : 'Windower profile name. Blank uses Default Profile.'}>
+-          <TextField value={windower} onChange={setWindower} placeholder={effective === 'Ashita' ? 'default.ini' : 'Default Profile'} />
++          {effective === 'Ashita'
++            ? <TextField value={ashitaBootIni} onChange={setAshitaBootIni} placeholder="default.ini" />
++            : <TextField value={windower} onChange={setWindower} placeholder="Default Profile" />}
+         </RowStacked>
+         <RowStacked label="POL Member List Slot" desc="Which slot this account sits on in the PlayOnline member list.">
+           <Select
+diff --git a/ui/webui/src/components/AccountWizard.tsx b/ui/webui/src/components/AccountWizard.tsx
+index 5260f1b..dbfc8c6 100644
+--- a/ui/webui/src/components/AccountWizard.tsx
++++ b/ui/webui/src/components/AccountWizard.tsx
+@@ -94,7 +94,8 @@ export function AccountWizard({ accounts, config, onClose, onSaved, onQuickAdd }
+     try {
+       await api.saveAccount({
+         profile: name.trim(),
+-        windower: windower.trim() || (launcher === 'Ashita' ? 'default.ini' : 'Default Profile'),
++        windower: launcher === 'Ashita' ? '' : (windower.trim() || 'Default Profile'),
++        ashitaBootIni: launcher === 'Ashita' ? (windower.trim() || 'default.ini') : '',
+         polSlot: Number(polSlot) || 1,
+         ingameSlot: Number(ingameSlot) || 1,
+         launcher,
+diff --git a/ui/webui/src/demo.ts b/ui/webui/src/demo.ts
+index bf6a7ef..0f07655 100644
+--- a/ui/webui/src/demo.ts
++++ b/ui/webui/src/demo.ts
+@@ -47,6 +47,7 @@ export const demoConfig: Config = {
+   staggerSeconds: 8,
+   fastSequential: true,
+   loginTimeoutSeconds: 120,
++  inGameConfirmTimeoutSeconds: 150,
+   hidePolWindow: true,
+   disableAutoLogin: false,
+   usePolProxy: true,
+@@ -66,7 +67,7 @@ export const demoConfig: Config = {
+   checkUpdatesOnStartup: true,
+   skippedUpdateVersion: '',
+   diagnosticsUploadUrl: '',
+-  currentVersion: '1.2.11',
++  currentVersion: '1.2.16',
+   clockSkewSeconds: null,
+   loginBinBackupEnabled: true,
+   loginBinBackupsKeep: 10,
+diff --git a/ui/webui/src/types.ts b/ui/webui/src/types.ts
+index b6d548e..dbc03b8 100644
+--- a/ui/webui/src/types.ts
++++ b/ui/webui/src/types.ts
+@@ -5,7 +5,8 @@ export type Launcher = 'Default' | 'Windower' | 'Ashita';
+ 
+ export interface Account {
+   profile: string;     // account name (unique key)
+-  windower: string;    // Windower profile name OR Ashita boot .ini
++  windower: string;    // Windower profile name
++  ashitaBootIni?: string; // Ashita boot .ini (kept separately since v1.2.13)
+   polSlot: number;     // POL member-list slot 1-20, 0 = unset (manual)
+   ingameSlot: number;  // FFXI character slot 1-16, 0 = first
+   launcher: Launcher;  // per-account launcher, 'Default' falls back to config
+@@ -45,6 +46,7 @@ export interface Config {
+   staggerSeconds: number;
+   fastSequential: boolean;
+   loginTimeoutSeconds: number;
++  inGameConfirmTimeoutSeconds?: number;
+   hidePolWindow: boolean;
+   disableAutoLogin: boolean;
+   usePolProxy: boolean;
+@@ -136,6 +138,7 @@ export interface AccountSave {
+   profile: string;
+   originalProfile?: string; // set when renaming
+   windower: string;
++  ashitaBootIni?: string;
+   polSlot: number;
+   ingameSlot: number;
+   launcher: Launcher;
+diff --git a/ui/webui/src/views/Home.tsx b/ui/webui/src/views/Home.tsx
+index d999563..af469f9 100644
+--- a/ui/webui/src/views/Home.tsx
++++ b/ui/webui/src/views/Home.tsx
+@@ -20,6 +20,8 @@ const isLaunchable = (s: LaunchState) => LAUNCHABLE.has(s);
+ const isRunning = (s: LaunchState) => !isLaunchable(s);
+ const BOOTING = new Set<LaunchState>(['LAUNCH WINDOWER', 'LAUNCH ASHITA']);
+ const canTerminate = (s: LaunchState) => isRunning(s) && !BOOTING.has(s);
++// Statuses that get the per-row Refresh (clear stuck status) button (upstream v1.2.13).
++const REFRESHABLE = new Set<string>(['FAILED', 'TIMEOUT', 'WRONG SE PASSWORD', 'LOGIN STUCK', 'DISCONNECTED']);
+ 
+ export default function Home({ accounts, statuses, config, refreshAccounts, sel, setSel }:
+   { accounts: Account[]; statuses: Record<string, AccountStatus>; config: Config | null; refreshAccounts: () => void;
+@@ -219,7 +221,7 @@ export default function Home({ accounts, statuses, config, refreshAccounts, sel,
+                       <span className="w-8 grid place-items-center">
+                         <img src={eff === 'Ashita' ? '/ashita.png' : '/windower.png'} alt={eff} title={eff} className="w-5 h-5 object-contain" />
+                       </span>
+-                      <span className="w-20 @max-[520px]:hidden text-[11px] text-fg-3 truncate">{a.windower || '—'}</span>
++                      <span className="w-20 @max-[520px]:hidden text-[11px] text-fg-3 truncate">{(eff === 'Ashita' ? a.ashitaBootIni : a.windower) || '—'}</span>
+                       <span className="w-6 text-center text-[11px] text-fg-3 tabular-nums">{a.polSlot || '—'}</span>
+                       <span className="w-40 flex justify-center">
+                         {st === 'RUNNING' && statuses[a.profile]?.countdownSeconds != null
+@@ -240,6 +242,9 @@ export default function Home({ accounts, statuses, config, refreshAccounts, sel,
+                             onOpenChange={setPopoverOpen}
+                           />
+                         )}
++                        {REFRESHABLE.has(st) && (
++                          <IconBtn title="Refresh (clear stuck status)" onClick={() => { void api.resetStatus(a.profile); }}>↻</IconBtn>
++                        )}
+                         {isLaunchable(st)
+                           ? <IconBtn title="Launch" success onClick={() => launchProfiles([a.profile])}>▶</IconBtn>
+                           : <IconBtn title="Terminate" danger disabled={!canTerminate(st)} onClick={() => confirmTerminate([a.profile])}>✕</IconBtn>}
 diff --git a/ui/webui/src/views/Settings.tsx b/ui/webui/src/views/Settings.tsx
-index 9a19279..cbb2ec5 100644
+index 9a19279..b5bbfdd 100644
 --- a/ui/webui/src/views/Settings.tsx
 +++ b/ui/webui/src/views/Settings.tsx
 @@ -1,14 +1,12 @@
@@ -641,7 +1562,17 @@ index 9a19279..cbb2ec5 100644
    const [logsWarnOpen, setLogsWarnOpen] = useState(false);
    if (!config) return <div className="px-5 py-10 text-center text-[12px] text-fg-4">Loading settings…</div>;
    const c = config;
-@@ -112,11 +110,10 @@ export default function Settings({ config, patchConfig }:
+@@ -45,6 +43,9 @@ export default function Settings({ config, patchConfig }:
+         <RowStacked label="Login Timeout" desc="Max seconds to wait for a login before marking it failed.">
+           <Slider value={c.loginTimeoutSeconds} min={30} max={300} suffix="s" onChange={(v) => patchConfig({ loginTimeoutSeconds: v })} />
+         </RowStacked>
++        <RowStacked label="In-Game Confirm Timeout" desc="How long to wait after DONE for Forest to confirm the character reached the game world before marking it Login Stuck.">
++          <Slider value={c.inGameConfirmTimeoutSeconds ?? 150} min={30} max={600} suffix="s" onChange={(v) => patchConfig({ inGameConfirmTimeoutSeconds: v })} />
++        </RowStacked>
+         <RowStacked label="Shared OTP Cooldown" desc="Forest will stagger consecutive account launches that are detected to have the same OTP by the specified delay.">
+           <Slider value={c.minSecondsBetweenLaunches} min={0} max={120} suffix="s" onChange={(v) => patchConfig({ minSecondsBetweenLaunches: v })} />
+         </RowStacked>
+@@ -112,11 +113,10 @@ export default function Settings({ config, patchConfig }:
          </Row>
        </Group>
  
@@ -656,7 +1587,7 @@ index 9a19279..cbb2ec5 100644
        </Group>
  
        <Group title="POL ACCOUNT SAFETY">
-@@ -145,79 +142,27 @@ export default function Settings({ config, patchConfig }:
+@@ -145,79 +145,27 @@ export default function Settings({ config, patchConfig }:
          <Row label="Enable Debug Logging" desc="Verbose logs to help diagnose problems.">
            <Toggle on={c.debugLogging} onChange={(v) => patchConfig({ debugLogging: v })} />
          </Row>
@@ -738,7 +1669,7 @@ index 9a19279..cbb2ec5 100644
  
  function PolBackupPanel({ config, patchConfig }:
    { config: Config; patchConfig: (p: Partial<Config>) => void }) {
-@@ -413,8 +358,8 @@ function fmtSize(n: number): string {
+@@ -413,8 +361,8 @@ function fmtSize(n: number): string {
    return `${(n / 1024 / 1024).toFixed(2)} MB`;
  }
  
@@ -749,7 +1680,7 @@ index 9a19279..cbb2ec5 100644
    return createPortal(
      <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/60" onMouseDown={onCancel}>
        <div className="w-[520px] max-w-[92vw] rounded-xl bg-surface border border-amber-500/40 p-4 shadow-2xl" onMouseDown={(e) => e.stopPropagation()}>
-@@ -429,12 +374,12 @@ function LogsWarnModal({ onCancel, onContinue, onUploadInstead }:
+@@ -429,12 +377,12 @@ function LogsWarnModal({ onCancel, onContinue, onUploadInstead }:
            The files in this folder contain your <b className="text-fg">Windows username</b>, your <b className="text-fg">account/character names</b>, and your <b className="text-fg">Windower/Ashita profile names</b> in plaintext. Do not send them directly to Discord or email.
          </div>
          <div className="text-[12px] text-fg-2 leading-relaxed mb-4">
@@ -764,7 +1695,7 @@ index 9a19279..cbb2ec5 100644
          </div>
        </div>
      </div>,
-@@ -442,98 +387,8 @@ function LogsWarnModal({ onCancel, onContinue, onUploadInstead }:
+@@ -442,98 +390,8 @@ function LogsWarnModal({ onCancel, onContinue, onUploadInstead }:
    );
  }
  
@@ -781,7 +1712,7 @@ index 9a19279..cbb2ec5 100644
 -  const pct = snap?.desktop.total && snap.desktop.total > 0
 -    ? Math.min(100, Math.round(((snap.desktop.downloaded ?? 0) / snap.desktop.total) * 100))
 -    : null;
- 
+-
 -  return (
 -    <div className="px-3.5 py-3">
 -      <div className="flex items-center justify-between gap-2">
@@ -793,7 +1724,7 @@ index 9a19279..cbb2ec5 100644
 -        </div>
 -        <Button onClick={() => api.updateCheck()}>{kind === 'checking' ? 'Checking…' : 'Check Now'}</Button>
 -      </div>
- 
+-
 -      {kind === 'available' && ver && (
 -        <div className="mt-3 rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3">
 -          <div className="flex items-center justify-between gap-2 mb-1">
@@ -826,11 +1757,11 @@ index 9a19279..cbb2ec5 100644
 -      {kind === 'installing' && (
 -        <div className="mt-3 text-[11px] text-fg-3">Installing v{ver ?? '?'} — Forest will restart automatically.</div>
 -      )}
--
+ 
 -      {kind === 'installed' && (
 -        <div className="mt-3 text-[11px] text-emerald-300">Update staged. Restarting Forest…</div>
 -      )}
--
+ 
 -      {kind === 'none' && (
 -        <div className="mt-3 text-[11px] text-fg-3">Forest is up to date.</div>
 -      )}

@@ -2,6 +2,10 @@
 # (755ebae of github.com/suspiciousman3187/Forest, the v1.2.15/v1.2.16
 # source with the November 2026 PlayOnline login fix), with these removed:
 # the auto-updater, the diagnostics upload, and the developer folder override.
+# The same patch also adds the reviewed v1.2.12-v1.2.16 changes ported from the
+# developer's release builds (desktop shortcuts, shared state folder, Refresh
+# button, Ashita boot-config field, login_w.bin gate/auto-restore, in-game
+# confirm timeout) and sets the version to 1.2.16.
 # The changes are in .github/forest-hardening.patch in this repo.
 # Run it from the Actions tab -> "Build Forest (reviewed)" -> Run workflow.
 # The finished zip appears under "Artifacts" at the bottom of the run page.
@@ -66,7 +70,9 @@ jobs:
           if grep -q HttpClient ui/Core/UpdateManager.cs; then echo "updater still present"; exit 1; fi
           if grep -rq "gnosis-xi.com" ui; then echo "upload endpoint still present"; exit 1; fi
           if grep -q "TreesVersionsMatch" ui/Core/Config.cs; then echo "folder override still present"; exit 1; fi
-          echo "Removals applied"
+          grep -q "<Version>1.2.16</Version>" ui/Forest.UI.csproj
+          test -e ui/Core/DesktopShortcut.cs
+          echo "Removals and v1.2.16 changes applied"
 
       - name: Build Trees.dll and waitinject.exe (32-bit)
         shell: pwsh
@@ -112,7 +118,7 @@ jobs:
         run: |
           $out = "$env:GITHUB_WORKSPACE/Forest-SelfBuilt"
           $files = @("$out/Forest.exe", "$out/Forest.dll", "src/trees/Trees.dll", "src/trees/waitinject.exe")
-          $lines = @("Built from commit $env:COMMIT with the auto-updater, diagnostics upload and developer folder override removed.", "")
+          $lines = @("Forest v1.2.16 (self-built). Upstream commit $env:COMMIT plus ported v1.2.12-v1.2.16 changes; auto-updater, diagnostics upload and developer folder override removed.", "")
           foreach ($f in $files) { if (Test-Path $f) { $lines += ("{0}  {1}" -f (Get-FileHash $f -Algorithm SHA256).Hash, (Split-Path $f -Leaf)) } }
           $lines | Tee-Object -FilePath "$out/BUILD-INFO.txt"
           $lines | ForEach-Object { "    $_" } | Out-File -Append -FilePath $env:GITHUB_STEP_SUMMARY
