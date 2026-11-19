@@ -1,5 +1,5 @@
 diff --git a/trees/Trees.cpp b/trees/Trees.cpp
-index 6dd1ec9..f91bb77 100644
+index 6dd1ec9..ee87a8e 100644
 --- a/trees/Trees.cpp
 +++ b/trees/Trees.cpp
 @@ -142,12 +142,24 @@ static void DllSibling(char* out, DWORD n, const char* leaf)
@@ -37,6 +37,109 @@ index 6dd1ec9..f91bb77 100644
      FILE* f = nullptr;
      if (fopen_s(&f, p, "w") != 0 || !f) return;
      SYSTEMTIME t; GetLocalTime(&t);
+@@ -3217,6 +3229,57 @@ static uint32_t FindWideStringInHeap(const wchar_t* needle)
+     return 0;
+ }
+ 
++// ---- Post-connect screens Forest doesn't drive (updates etc.) --------------
++// After Connect, PlayOnline sometimes shows a screen the navigator doesn't
++// know: most often the PlayOnline Viewer or FINAL FANTASY XI version-update
++// prompt and download. Terminating pol.exe there cancels the update (and the
++// 60s late-stash would keep its dialog off-screen), so instead every window
++// of this process is brought back on screen and left for the user to finish.
++
++struct RevealCtx { int n; bool raiseAll; };
++
++static BOOL CALLBACK RevealEnumCb(HWND h, LPARAM lp)
++{
++    auto* ctx = (RevealCtx*)lp;
++    DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
++    if (pid != GetCurrentProcessId()) return TRUE;
++    if (GetWindowLongA(h, GWL_STYLE) & WS_CHILD) return TRUE;
++    if (!IsWindowVisible(h)) return TRUE;
++    RECT r{}; GetWindowRect(h, &r);
++    char cls[64] = {0}; GetClassNameA(h, cls, sizeof(cls));
++    char ttl[96] = {0}; GetWindowTextA(h, ttl, sizeof(ttl));
++    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
++    bool offscreen = (r.left <= -30000 || r.top <= -30000);
++    if (!offscreen && !ctx->raiseAll) return TRUE;   // already visible; don't keep raising it
++    if (offscreen) {
++        int pw = GetSystemMetrics(SM_CXSCREEN), ph = GetSystemMetrics(SM_CYSCREEN);
++        int w = r.right - r.left, hgt = r.bottom - r.top;
++        int x = (pw - w) / 2, y = (ph - hgt) / 2;
++        if (x < vx) x = vx + 60;
++        if (y < vy) y = vy + 60;
++        SetWindowPos(h, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
++    }
++    // Raise above other windows without stealing keyboard focus.
++    SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
++    SetWindowPos(h, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
++    FLASHWINFO fw{ sizeof(fw), h, FLASHW_ALL | FLASHW_TIMERNOFG, 5, 0 };
++    FlashWindowEx(&fw);
++    ++ctx->n;
++    Log("REVEAL: hwnd=0x%p class=[%s] title=[%s] was at %ld,%ld", h, cls, ttl, r.left, r.top);
++    return TRUE;
++}
++
++static int RevealPolWindows(bool raiseAll)
++{
++    if (g_dryRun) return 0;
++    g_hideEnabled = false;
++    g_winEvLateActive = false;     // stop stashing new dialogs
++    if (g_winEvHook) { UnhookWinEvent(g_winEvHook); g_winEvHook = nullptr; }
++    RevealCtx ctx{ 0, raiseAll };
++    EnumWindows(RevealEnumCb, (LPARAM)&ctx);
++    return ctx.n;
++}
++
+ static DWORD WINAPI PostConnectWatchdog(LPVOID)
+ {
+     Log("PostConnectWatchdog: armed (10s POL-5311 scan, 30s stuck deadline)");
+@@ -3266,13 +3329,37 @@ static DWORD WINAPI PostConnectWatchdog(LPVOID)
+     if (uint32_t hit = tryFindPOL5311()) { fireWrongPw(hit); return 0; }
+     if (g_fastLoginDone) return 0;
+ 
+-    Log("PostConnectWatchdog: POL window still alive at +30s with no "
+-        "POL-5311 string. Likely a non-WRONG_SE_PASSWORD error (network / "
+-        "server / OTP / ban / etc.). Writing FAILED|POST_CONNECT_STUCK "
+-        "and self-terminating.");
+-    WriteStatus("FAILED", "POST_CONNECT_STUCK");
+-    Sleep(750);
+-    TerminateProcess(GetCurrentProcess(), 1);
++    // Not a wrong password, and POL hasn't moved on: usually an update screen
++    // (or another dialog: network, maintenance, OTP...). Show it to the user
++    // instead of terminating, and keep watching.
++    {
++        int shown = RevealPolWindows(true);
++        Log("PostConnectWatchdog: POL still on a screen at +30s with no POL-5311. "
++            "Likely a PlayOnline / FINAL FANTASY XI update or another dialog. "
++            "NOT terminating; revealed %d window(s) for the user. Writing "
++            "ATTENTION|POST_CONNECT_SCREEN.", shown);
++        WriteStatus("ATTENTION", "POST_CONNECT_SCREEN");
++    }
++
++    // Updates can take a long time; watch for up to 4 hours.
++    for (int i = 0; i < 4 * 3600 / 5; ++i) {
++        Sleep(5000);
++        if (g_inGameFired) { Log("PostConnectWatchdog: in game after user-handled screen."); return 0; }
++        if (GetModuleHandleA("FFXiMain.dll")) {
++            Log("PostConnectWatchdog: FFXiMain.dll loaded after user-handled screen; leaving login to the game.");
++            SafeWriteDone("FFXI started after attention screen");
++            return 0;
++        }
++        if (!PolWnd()) {
++            Log("PostConnectWatchdog: POL window gone after attention screen.");
++            SafeWriteDone("POL gone after attention screen");
++            return 0;
++        }
++        // New dialogs (e.g. the update's own prompts or POL-1160) stay visible.
++        if (i % 2 == 1) RevealPolWindows(false);
++        if (i % 6 == 5) if (uint32_t hit = tryFindPOL5311()) { fireWrongPw(hit); return 0; }
++    }
++    Log("PostConnectWatchdog: attention screen still open after 4h; giving up watching (POL left running).");
+     return 0;
+ }
+ 
 diff --git a/trees/Trees.rc b/trees/Trees.rc
 index d7d465c..3e3deab 100644
 --- a/trees/Trees.rc
@@ -1038,7 +1141,7 @@ index e10edfb..8d51d3d 100644
      <ApplicationManifest>app.manifest</ApplicationManifest>
      <ApplicationIcon>Assets\app.ico</ApplicationIcon>
 diff --git a/ui/WebBridge.cs b/ui/WebBridge.cs
-index 0171227..8df97a4 100644
+index 0171227..e4d789b 100644
 --- a/ui/WebBridge.cs
 +++ b/ui/WebBridge.cs
 @@ -77,7 +77,6 @@ public sealed class WebBridge
@@ -1158,7 +1261,28 @@ index 0171227..8df97a4 100644
  
          if (editing && totp != null) store.SetTotp(profile, totp);
  
-@@ -752,10 +752,10 @@ public sealed class WebBridge
+@@ -745,6 +745,20 @@ public sealed class WebBridge
+                     && (f == "LAUNCHING GAME" || f == "LAUNCH POL"
+                         || f == "SELECT ACCOUNT" || f == "INPUT PASSWORD"
+                         || f == "LOGGING IN");
++                if (f == "NEEDS ATTENTION" && currentStatus != "NEEDS ATTENTION")
++                {
++                    DiagLog.Log($"[{profile}] POL is on a screen Forest doesn't recognize after connecting " +
++                                "(usually a PlayOnline / FFXI update). Window shown; holding other launches.");
++                    Emit("notice", new
++                    {
++                        id = $"attention-{profile}-{h.Pid}",
++                        level = "warning",
++                        title = $"{profile}: PlayOnline needs you",
++                        message = "PlayOnline stopped on a screen Forest doesn't handle, usually a PlayOnline or " +
++                                  "FINAL FANTASY XI update. Its window is now on screen: finish the update there. " +
++                                  "Forest is holding your other characters until this one is done.",
++                    });
++                }
+                 if (!isRunningDowngrade) Set(profile, f, h.Pid);
+             }
+ 
+@@ -752,10 +766,10 @@ public sealed class WebBridge
              {
                  if (!_doneSince.ContainsKey(h.Pid))
                      _doneSince[h.Pid] = DateTime.UtcNow;
@@ -1171,7 +1295,17 @@ index 0171227..8df97a4 100644
                                  "Trees.dll never confirmed in-game (sig-scan may have missed party global). " +
                                  "NOT terminating pol.exe — leaving it running. Marking as LOGIN STUCK for visibility. " +
                                  "If FFXiMain.dll subsequently loads in the pol.exe process, we'll auto-promote to RUNNING.");
-@@ -1069,9 +1069,38 @@ public sealed class WebBridge
+@@ -972,6 +986,9 @@ public sealed class WebBridge
+             "DONE" => "LAUNCHING GAME",
+             "IN_GAME" => "RUNNING",
+             "DISCONNECTED" => "DISCONNECTED",
++            // PlayOnline is on a screen Forest doesn't drive (usually an update);
++            // Trees.dll has brought its window on screen for the user.
++            "ATTENTION" => "NEEDS ATTENTION",
+             "FAILED" => "FAILED",
+             _ => "",
+         };
+@@ -1069,9 +1086,38 @@ public sealed class WebBridge
          return true;
      }
  
@@ -1210,7 +1344,7 @@ index 0171227..8df97a4 100644
          var launch = profiles.Where(IsLaunchable).ToList();
          if (launch.Count == 0) return;
  
-@@ -1084,6 +1113,8 @@ public sealed class WebBridge
+@@ -1084,6 +1130,8 @@ public sealed class WebBridge
          {
              try { LoginBinBackup.RunBackup(cfgForBackup); }
              catch (Exception ex) { DiagLog.Log("Launch: login_w.bin pre-backup failed: " + ex.Message); }
@@ -1219,7 +1353,7 @@ index 0171227..8df97a4 100644
          });
  
          _launching = true;
-@@ -1184,6 +1215,7 @@ public sealed class WebBridge
+@@ -1184,17 +1232,31 @@ public sealed class WebBridge
                      {
                          // No login to gate on; just stagger so we don't open every POL at once.
                          Thread.Sleep(TimeSpan.FromSeconds(Math.Max(1, cfg.StaggerSeconds)));
@@ -1227,7 +1361,20 @@ index 0171227..8df97a4 100644
                          continue;
                      }
                      var deadline = DateTime.UtcNow.AddSeconds(cfg.LoginTimeoutSeconds + 30);
-@@ -1195,6 +1227,10 @@ public sealed class WebBridge
++                    var attentionCap = DateTime.UtcNow.AddHours(4);
+                     while (DateTime.UtcNow < deadline)
+                     {
+                         var st = _ui.Invoke(() => StatOf(launch[i]).Status);
++                        // While the user finishes an update in this POL, don't start the
++                        // next one (two POLs patching the same files at once is unsafe).
++                        if (st == "NEEDS ATTENTION" && DateTime.UtcNow < attentionCap)
++                        {
++                            deadline = DateTime.UtcNow.AddSeconds(cfg.LoginTimeoutSeconds + 30);
++                            Thread.Sleep(1000);
++                            continue;
++                        }
+                         if (st is "RUNNING" or "FAILED" or "TERMINATED" or "TIMEOUT" or "ERR" or "INACTIVE") break;
+                         if (fast && string.Equals(st, "LOGGING IN", StringComparison.OrdinalIgnoreCase)) break;
                          Thread.Sleep(500);
                      }
  
@@ -1238,7 +1385,7 @@ index 0171227..8df97a4 100644
                      // FFXi bg-res clobber barrier (opt-in, Windower-only). The
                      // next Windower launch will write its profile's bg-res
                      // values directly into HKLM\...\FinalFantasyXI\0001-0004;
-@@ -1328,7 +1364,7 @@ public sealed class WebBridge
+@@ -1328,7 +1390,7 @@ public sealed class WebBridge
      private void ReattachRunning()
      {
          string dir;
@@ -1247,7 +1394,7 @@ index 0171227..8df97a4 100644
          catch { return; }
          if (!Directory.Exists(dir)) return;
  
-@@ -1365,7 +1401,7 @@ public sealed class WebBridge
+@@ -1365,7 +1427,7 @@ public sealed class WebBridge
      private object[] ScanStale()
      {
          string dir;
@@ -1256,7 +1403,7 @@ index 0171227..8df97a4 100644
          catch { return Array.Empty<object>(); }
          if (!Directory.Exists(dir)) return Array.Empty<object>();
  
-@@ -1390,7 +1426,7 @@ public sealed class WebBridge
+@@ -1390,7 +1452,7 @@ public sealed class WebBridge
      private void KillStale(int[] pids)
      {
          string dir;
@@ -1480,7 +1627,7 @@ index bf6a7ef..0f07655 100644
    loginBinBackupEnabled: true,
    loginBinBackupsKeep: 10,
 diff --git a/ui/webui/src/types.ts b/ui/webui/src/types.ts
-index b6d548e..dbc03b8 100644
+index b6d548e..b7ae981 100644
 --- a/ui/webui/src/types.ts
 +++ b/ui/webui/src/types.ts
 @@ -5,7 +5,8 @@ export type Launcher = 'Default' | 'Windower' | 'Ashita';
@@ -1493,6 +1640,15 @@ index b6d548e..dbc03b8 100644
    polSlot: number;     // POL member-list slot 1-20, 0 = unset (manual)
    ingameSlot: number;  // FFXI character slot 1-16, 0 = first
    launcher: Launcher;  // per-account launcher, 'Default' falls back to config
+@@ -24,7 +25,7 @@ export type LaunchState =
+   | 'INPUT PASSWORD' | 'LOGGING IN' | 'LAUNCHING GAME'
+   | 'RUNNING' | 'DONE' | 'LOGIN COMPLETE'
+   | 'FAILED' | 'WRONG SE PASSWORD' | 'LOGIN STUCK' | 'TIMEOUT' | 'TERMINATED'
+-  | 'DISCONNECTED';
++  | 'DISCONNECTED' | 'NEEDS ATTENTION';
+ 
+ export interface AccountStatus {
+   profile: string;
 @@ -45,6 +46,7 @@ export interface Config {
    staggerSeconds: number;
    fastSequential: boolean;
@@ -1794,3 +1950,15 @@ index 9a19279..b5bbfdd 100644
  
  function DurationPicker({ minutes, onChange }: { minutes: number; onChange: (m: number) => void }) {
    const h = Math.floor(minutes / 60);
+diff --git a/ui/webui/src/widgets.tsx b/ui/webui/src/widgets.tsx
+index 469a11b..a42af05 100644
+--- a/ui/webui/src/widgets.tsx
++++ b/ui/webui/src/widgets.tsx
+@@ -48,6 +48,7 @@ const STATE: Record<LaunchState, { cls: string; dot?: string; pulse?: boolean }>
+   FAILED:            { cls: 'text-red-300 bg-red-500/12 border border-red-500/40',   dot: 'bg-red-400' },
+   'WRONG SE PASSWORD': { cls: 'text-rose-300 bg-rose-500/12 border border-rose-500/40', dot: 'bg-rose-400' },
+   'LOGIN STUCK':     { cls: 'text-red-300 bg-red-500/12 border border-red-500/40',   dot: 'bg-red-400' },
++  'NEEDS ATTENTION': { cls: 'text-amber-300 bg-amber-500/12 border border-amber-500/40', dot: 'bg-amber-400', pulse: true },
+   TIMEOUT:           { cls: 'text-red-300 bg-red-500/12 border border-red-500/40',   dot: 'bg-red-400' },
+   DISCONNECTED:      { cls: 'text-red-300 bg-red-500/12 border border-red-500/40',   dot: 'bg-red-400' },
+ };
